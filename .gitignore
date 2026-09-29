@@ -1,0 +1,59 @@
+@"
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+#excel
+*.xlsx
+*.xls
+
+# Database files (we don't want to push scraped data to GitHub)
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+data/*.sqlite3
+
+# Logs and temporary files
+logs/
+*.log
+*.tmp
+
+# Environment variables (secrets, API keys)
+.env
+
+# IDE specific
+.vscode/
+.idea/
+*.iml
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Playwright browsers (large, not needed in repo)
+node_modules/
+test-results/
+playwright-report/
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+"@ | Out-File -FilePath .gitignore -Encoding utf8
+
+clear.py
+
+# just ignore
+repomix-output.xml
+\output
+\logs
+
+Procfile

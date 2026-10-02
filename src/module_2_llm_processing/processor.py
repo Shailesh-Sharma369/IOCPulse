@@ -1,27 +1,29 @@
 """
-processor.py – Module 2: LLM-based CTI entity extraction.
+processor.py – Module 2: LLM-based CTI entity extraction (Gemini backend).
 
-Architecture (unchanged):
+Pipeline
+--------
   ArticleProcessor.run()
-    → _clean_html()          HTML → plain text via trafilatura
-    → _build_messages()      Prompt construction (system + 1-shot + user)
-    → LLMClient.generate()   Batch inference via remote Qwen2.5-3B server
-    → _attempt_parse()       Robust JSON extraction + normalisation
-    → _merge_iocs()          Union of LLM output and regex fallback
-    → verify_article()       Confidence scoring against original text
-    → _filter_verified_entities()  Remove unverifiable values
-    → _save_and_mark()       Persist to DB
+    → _ping_llm()                 Fail-fast check that Gemini is reachable
+    → _fetch_pending()            Pull PENDING rows from staging_raw
+    → _clean_html()               HTML → plain text via trafilatura
+    → _build_messages()           Prompt construction (system + 1-shot + user)
+    → LLMClient.generate()        Gemini batched generation (JSON mode)
+    → _attempt_parse()            Robust JSON extraction + normalisation
+    → _merge_iocs()               Union of LLM output and regex fallback
+    → verify_article()            Confidence scoring against original text
+    → _filter_verified_entities() Remove unverifiable values
+    → _save_and_mark()            Persist to DB with severity/TLP
 
-Improvements:
-- Prompt redesigned with synthetic one-shot and strict anti-hallucination rules.
-- IOC validation using existing strict regex patterns, with defanged IOC normalization.
-- Validation performed after merging (regex + LLM) for full coverage.
-- Verification filtering per-item (not field-level) for both IOCs and metadata.
-- Metadata fields that are often inferred (attack_type, target_industry) are not filtered.
-- MITRE techniques filtered using mitre_valid array.
-- Debug file writes guarded by DEBUG_WRITE_FILES environment variable.
-- Merge strategy unchanged (regex priority for strict fields, LLM backup for fallback).
-- Expanded placeholder list.
+Design notes
+------------
+- Regex extraction is a *validation helper*, not a substitute for the LLM.
+  If Gemini fails, we mark the article FAILED — we do NOT silently fall back
+  to regex. Failing closed keeps CTI data trustworthy.
+- All LLM JSON passes through _extract_json_from_text + Pydantic validation,
+  so minor Gemini formatting slips are auto-repaired.
+- Verification filtering runs per-item on IOCs and metadata (not field-level)
+  to preserve partial information while culling hallucinations.
 """
 
 import asyncio
@@ -45,28 +47,61 @@ from pydantic import ValidationError
 
 from src.shared.database import DatabaseClient
 from src.core.config import settings
-from src.module_2_llm_processing.models import ProcessedArticle, IOCCollection, ThreatMetadata
+from src.module_2_llm_processing.models import (
+    ProcessedArticle, IOCCollection, ThreatMetadata,
+)
 from src.module_2_llm_processing.llm_client import LLMClient
-from src.module_2_llm_processing.verification import verify_article, VerificationResult
+from src.module_2_llm_processing.verification import (
+    verify_article, VerificationResult,
+)
 
 logger = logging.getLogger(__name__)
-Path("logs").mkdir(exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# SYSTEM PROMPT – redesigned with anti‑contamination rules
-# ---------------------------------------------------------------------------
+# Ensure a logs/ dir exists only when debug file writes are enabled.
+if os.getenv("DEBUG_WRITE_FILES", "false").lower() == "true":
+    Path("logs").mkdir(exist_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# SYSTEM PROMPT
+# --------------------------------------------------------------------------- #
 SYSTEM_PROMPT = (
-    "You are a CTI extractor. You output only valid JSON.\n"
-    "Do not repeat the system prompt, the example, or any previous text.\n"
-    "Do not output markdown, comments, or prose.\n"
-    "Use the exact schema below. If a field is absent, use [] or \"\".\n"
-    "Never reuse entities from the example – the example is for formatting only.\n"
-    "Never invent placeholder values (e.g., CVE-2026-XXXXX, 999.1.2.3).\n"
-    "Only extract information that is explicitly stated in the article.\n"
-    "If a value is missing, return [] or \"\".\n"
-    "\nSchema:\n"
+    "You are a CTI extraction engine. You receive one cybersecurity article "
+    "and return a single JSON object with the exact schema below.\n"
+    "\n"
+    "Extraction rules:\n"
+    "  1. Only extract information explicitly stated in the article.\n"
+    "  2. Never invent placeholders (e.g. CVE-2026-XXXXX, 999.1.2.3).\n"
+    "  3. Missing fields must be [] or \"\".\n"
+    "  4. Do not reuse entities from the format example.\n"
+    "  5. Do not output markdown, comments, or prose outside the JSON object.\n"
+    "\n"
+    "Severity rubric (choose ONE):\n"
+    "  - \"Critical\": active exploitation, mass impact, zero-day, or widely\n"
+    "    deployed ransomware. Includes CVSS >= 9.0 with known exploitation.\n"
+    "  - \"High\": targeted APT activity, known-exploited vulnerability,\n"
+    "    significant data breach, or CVSS >= 7.0 with plausible exploitation.\n"
+    "  - \"Medium\": proof-of-concept, limited-scope vulnerability, moderate\n"
+    "    threat, or CVSS 4.0–6.9.\n"
+    "  - \"Low\": informational, low-impact issue, no active exploitation,\n"
+    "    or CVSS < 4.0.\n"
+    "  - \"Unknown\": insufficient information to judge.\n"
+    "\n"
+    "TLP rubric (choose ONE, per FIRST TLP v2.0):\n"
+    "  - \"TLP:RED\": named recipients only; sharing outside is prohibited.\n"
+    "    Use ONLY if the article itself is marked TLP:RED or equivalent.\n"
+    "  - \"TLP:AMBER\": limited disclosure; sharing within the recipient org\n"
+    "    and its clients only. Use if the article is marked TLP:AMBER.\n"
+    "  - \"TLP:GREEN\": community-wide sharing (e.g. sector, country).\n"
+    "  - \"TLP:CLEAR\": public / unrestricted. This is the DEFAULT for\n"
+    "    public advisories, vendor blogs, and news articles.\n"
+    "  If the article does not state a TLP, default to TLP:CLEAR.\n"
+    "\n"
+    "Schema:\n"
     "{\n"
     "  \"summary\": \"...\",\n"
+    "  \"severity\": \"Unknown\",\n"
+    "  \"tlp_tag\": \"TLP:CLEAR\",\n"
     "  \"iocs\": {\n"
     "    \"ip\":[], \"domain\":[], \"url\":[], \"md5\":[], \"sha1\":[], \"sha256\":[],\n"
     "    \"cve\":[], \"email\":[], \"file_name\":[], \"registry_key\":[], \"mutex\":[], \"malware_family\":[]\n"
@@ -76,18 +111,17 @@ SYSTEM_PROMPT = (
     "    \"target_organization\":[], \"target_industry\":[], \"target_country\":[],\n"
     "    \"mitre_techniques\":[], \"affected_software\":[], \"campaign_name\":[], \"ransomware_family\":[]\n"
     "  }\n"
-    "}\n"
-    "Never invent information. Only extract what is explicitly stated."
+    "}"
 )
 
-# Fallback prompt – even shorter, only instructs to output JSON.
-FALLBACK_PROMPT = (
-    "\n\nOutput ONLY raw JSON with the exact schema. No extra text."
-)
+# Kept for potential manual "reprocess with fallback prompt" tooling. Not
+# on the automatic path anymore.
+FALLBACK_PROMPT = "\n\nOutput ONLY raw JSON with the exact schema. No extra text."
 
-# ---------------------------------------------------------------------------
-# REGEX PATTERNS (unchanged – reused for validation)
-# ---------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------- #
+# REGEX PATTERNS (validation + safety net for what the LLM returns)
+# --------------------------------------------------------------------------- #
 IPV4_PATTERN = re.compile(
     r'(?<![.\d])'
     r'(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}'
@@ -132,9 +166,10 @@ FILE_NAME_PATTERN = re.compile(
 
 DOMAIN_PATTERN = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.){1,10}[a-zA-Z]{2,}\b')
 
-# ---------------------------------------------------------------------------
-# BLOCKLISTS (unchanged)
-# ---------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------- #
+# BLOCKLISTS
+# --------------------------------------------------------------------------- #
 _DOMAIN_BLOCKLIST = frozenset({
     'python', 'golang', 'rust', 'kotlin', 'swift', 'scala', 'clojure',
     'erlang', 'elixir', 'haskell', 'dart', 'perl', 'ruby', 'lua', 'julia',
@@ -157,9 +192,10 @@ _FILE_EXTENSIONS = frozenset({
 _PRIVATE_IP_PREFIXES = ('10.', '192.168.', '127.', '0.', '255.')
 _PRINTABLE = frozenset(string.printable)
 
-# ---------------------------------------------------------------------------
-# Key aliases (extended)
-# ---------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------- #
+# Key alias map (LLM might return any casing / synonym)
+# --------------------------------------------------------------------------- #
 _KEY_ALIAS: Dict[str, str] = {
     "ioc": "iocs", "iobs": "iocs", "indicators": "iocs",
     "Iocs": "iocs", "IoCs": "iocs", "IOCs": "iocs",
@@ -167,6 +203,8 @@ _KEY_ALIAS: Dict[str, str] = {
     "threat_meta": "threat_metadata", "threat_metadta": "threat_metadata",
     "threat_metdata": "threat_metadata",
     "summary": "summary",
+    "severity": "severity", "Severity": "severity",
+    "tlp": "tlp_tag", "tlp_tag": "tlp_tag", "TLP": "tlp_tag", "TLP_Tag": "tlp_tag",
     "IP": "ip", "ipv4": "ip", "ip_v4": "ip", "ipv6": "ip", "ips": "ip",
     "Domain": "domain", "domains": "domain", "hostname": "domain",
     "hostnames": "domain", "domain_fqdn": "domain", "fqdn": "domain",
@@ -232,12 +270,15 @@ _ALL_LIST_FIELDS = _IOC_LIST_FIELDS | _META_LIST_FIELDS
 
 _FUZZY_CANONICAL_KEYS: List[str] = [
     k for k in (
-        list(_IOC_LIST_FIELDS) + list(_META_LIST_FIELDS) + ["iocs", "threat_metadata"]
+        list(_IOC_LIST_FIELDS) + list(_META_LIST_FIELDS)
+        + ["iocs", "threat_metadata"]
     )
     if len(k) > 4
 ]
 
-# Merge strategy (unchanged – regex priority for strict fields, LLM backup for fallback)
+# Merge strategy:
+#   _REGEX_ALWAYS_MERGE  → union LLM + regex (regex has priority)
+#   _REGEX_FALLBACK_ONLY → use LLM if non-empty, else regex
 _REGEX_ALWAYS_MERGE  = frozenset({"ip", "cve", "md5", "sha1", "sha256", "url"})
 _REGEX_FALLBACK_ONLY = frozenset({
     "domain", "email", "file_name", "registry_key", "mutex", "malware_family",
@@ -245,14 +286,21 @@ _REGEX_FALLBACK_ONLY = frozenset({
 
 
 def _fuzzy_resolve_key(key: str) -> Optional[str]:
+    """Levenshtein-style fuzzy match against canonical keys."""
     if len(key) <= 4:
         return None
     key_lower = key.lower().lstrip("._")
-    matches = difflib.get_close_matches(key_lower, _FUZZY_CANONICAL_KEYS, n=1, cutoff=0.6)
+    matches = difflib.get_close_matches(
+        key_lower, _FUZZY_CANONICAL_KEYS, n=1, cutoff=0.6,
+    )
     return matches[0] if matches else None
 
 
+# --------------------------------------------------------------------------- #
+# ArticleProcessor
+# --------------------------------------------------------------------------- #
 class ArticleProcessor:
+
     def __init__(
         self,
         llm_client: LLMClient,
@@ -264,31 +312,45 @@ class ArticleProcessor:
         self.db = db
         self.batch_size = batch_size or settings.LLM_BATCH_SIZE
         self.max_retries = max_retries
-        self.server_config_validated = False
         self.debug = os.getenv("DEBUG_WRITE_FILES", "false").lower() == "true"
 
-    async def _verify_server_config(self) -> None:
-        import httpx
+    # ------------------------------------------------------------------ #
+    # LLM health-check (fail-fast)
+    # ------------------------------------------------------------------ #
+    async def _ping_llm(self) -> None:
+        """
+        Send a single trivial prompt to Gemini. Fails fast if the model ID,
+        API key, or SDK wiring is wrong — instead of silently letting every
+        article fall through to a fake-success regex run.
+        """
+        logger.info(
+            "Pinging Gemini model '%s'…",
+            getattr(self.client, "model_name", "?"),
+        )
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"{self.client.base_url}/health")
-                resp.raise_for_status()
-                data = resp.json()
-            status = data.get("status", "unknown")
-            model  = data.get("model", "unknown")
-            device = data.get("device", "unknown")
-            cfg    = data.get("active_generation_config", {})
-            logger.info(
-                f"Server health: status={status} model={model} device={device} "
-                f"gen_config={cfg}"
+            responses = await self.client.generate(
+                [[
+                    {"role": "system", "content": "You output only valid JSON."},
+                    {"role": "user", "content": 'Return exactly: {"ok": true}'},
+                ]],
+                max_new_tokens=64,
+                temperature=0.0,
             )
-            if status not in ("ok",):
-                logger.warning(f"Server reports status='{status}' — model may still be loading.")
-            self.server_config_validated = True
+            snippet = (responses[0] or "").strip()[:120] if responses else "<empty>"
+            if not snippet:
+                raise RuntimeError("Gemini ping returned empty text.")
+            logger.info("✅ Gemini ping OK: %s", snippet)
         except Exception as exc:
-            logger.warning(f"Server health check failed: {exc}. Proceeding anyway.")
-            self.server_config_validated = True
+            logger.exception("Gemini ping FAILED — aborting run.")
+            raise RuntimeError(
+                f"LLM not reachable. Check GEMINI_API_KEY and "
+                f"GEMINI_MODEL_NAME='{getattr(self.client, 'model_name', '?')}'. "
+                f"Underlying error: {type(exc).__name__}: {exc}"
+            ) from exc
 
+    # ------------------------------------------------------------------ #
+    # HTML → plain text
+    # ------------------------------------------------------------------ #
     def _clean_html(self, html_content: str) -> str:
         if not html_content:
             return ""
@@ -303,9 +365,15 @@ class ArticleProcessor:
         soup = BeautifulSoup(html_content, "lxml")
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
-        lines = [ln.strip() for ln in soup.get_text(separator="\n").splitlines() if ln.strip()]
+        lines = [
+            ln.strip() for ln in soup.get_text(separator="\n").splitlines()
+            if ln.strip()
+        ]
         return html.unescape("\n".join(lines))
 
+    # ------------------------------------------------------------------ #
+    # Semantic truncation — keeps IOC-dense lines from being cut off
+    # ------------------------------------------------------------------ #
     def _semantic_truncate(
         self,
         text: str,
@@ -315,10 +383,12 @@ class ArticleProcessor:
     ) -> str:
         if len(text) <= max_chars:
             return text
+
         lines = text.splitlines(keepends=True)
         ioc_line_re = re.compile(
             r'(?:[0-9a-fA-F]{32,64})'
-            r'|(?:\b(?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d\d?)){3}\b)'
+            r'|(?:\b(?:25[0-5]|2[0-4]\d|[01]?\d\d?)'
+            r'(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d\d?)){3}\b)'
             r'|CVE-\d{4}-\d{4,7}'
             r'|[Tt]\d{4}(?:\.\d{3})?'
             r'|https?://'
@@ -327,29 +397,32 @@ class ArticleProcessor:
             r'|\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
             re.IGNORECASE,
         )
+
         ioc_lines: List[str] = []
         prose_lines: List[str] = []
         for ln in lines:
-            if ioc_line_re.search(ln):
-                ioc_lines.append(ln)
-            else:
-                prose_lines.append(ln)
+            (ioc_lines if ioc_line_re.search(ln) else prose_lines).append(ln)
+
         ioc_block = "".join(ioc_lines)
         prose_text = "".join(prose_lines)
-        ioc_block_len = len(ioc_block)
-        remaining = max_chars - ioc_block_len - 60
+
+        remaining = max_chars - len(ioc_block) - 60
         if remaining < 0:
-            ioc_block = ioc_block[:max_chars - 60]
+            ioc_block = ioc_block[: max_chars - 60]
             remaining = 0
+
         prose_head_chars = min(head_chars, remaining * 3 // 4)
         prose_tail_chars = min(tail_chars, remaining - prose_head_chars)
         head = prose_text[:prose_head_chars]
         tail = prose_text[-prose_tail_chars:] if prose_tail_chars > 0 else ""
+
+        # Snap to a natural sentence boundary
         for sep in ('\n\n', '. ', '! ', '? '):
             idx = head.rfind(sep)
             if idx > prose_head_chars // 2:
                 head = head[: idx + len(sep)]
                 break
+
         parts = [head]
         if ioc_block:
             parts.append("\n\n[--- IOC TABLE / INDICATOR SECTION ---]\n")
@@ -360,16 +433,18 @@ class ArticleProcessor:
             parts.append(tail)
         return "".join(parts)
 
-    def _build_messages(
-        self, article: Dict[str, Any], use_fallback: bool = False
-    ) -> List[Dict[str, str]]:
+    # ------------------------------------------------------------------ #
+    # Prompt construction
+    # ------------------------------------------------------------------ #
+    def _build_messages(self, article: Dict[str, Any]) -> List[Dict[str, str]]:
         title     = article.get("title", "Untitled")
         source    = article.get("source_domain", "Unknown")
         published = article.get("published_utc", "Unknown")
         body      = article.get("cleaned_text", "") or "No article body extracted."
-        body = self._semantic_truncate(body)
+        body      = self._semantic_truncate(body)
 
-        # 1-shot example with synthetic entities (formatting only)
+        # Synthetic one-shot with fake entities. The model must NOT reuse these
+        # values — the prompt explicitly forbids it.
         example_user = (
             "Title: Example\n"
             "Article: Threat actor ExampleActor used malware.exe from 192.0.2.1 "
@@ -378,39 +453,26 @@ class ArticleProcessor:
         )
         example_assistant = json.dumps({
             "summary": "ExampleActor used malware.exe and exploited CVE-2023-12345 to target the technology sector.",
+            "severity": "High",
+            "tlp_tag": "TLP:CLEAR",
             "iocs": {
                 "ip": ["192.0.2.1"],
-                "domain": [],
-                "url": [],
-                "md5": [],
-                "sha1": [],
-                "sha256": [],
-                "cve": ["CVE-2023-12345"],
-                "email": [],
-                "file_name": ["malware.exe"],
-                "registry_key": [],
-                "mutex": [],
-                "malware_family": []
+                "domain": [], "url": [], "md5": [], "sha1": [], "sha256": [],
+                "cve": ["CVE-2023-12345"], "email": [], "file_name": ["malware.exe"],
+                "registry_key": [], "mutex": [], "malware_family": [],
             },
             "threat_metadata": {
-                "threat_actor": ["ExampleActor"],
-                "malware_name": [],
+                "threat_actor": ["ExampleActor"], "malware_name": [],
                 "attack_type": ["Exploitation"],
-                "target_organization": ["ExampleOrg"],
-                "target_industry": ["Technology"],
-                "target_country": ["US"],
-                "mitre_techniques": ["T1001"],
-                "affected_software": [],
-                "campaign_name": [],
-                "ransomware_family": []
-            }
+                "target_organization": ["ExampleOrg"], "target_industry": ["Technology"],
+                "target_country": ["US"], "mitre_techniques": ["T1001"],
+                "affected_software": [], "campaign_name": [], "ransomware_family": [],
+            },
         }, separators=(",", ":"))
 
         user_content = (
             f"Title: {title}\nDate: {published}\nSource: {source}\n\nArticle:\n{body}"
         )
-        if use_fallback:
-            user_content += FALLBACK_PROMPT
 
         return [
             {"role": "system",    "content": SYSTEM_PROMPT},
@@ -419,44 +481,50 @@ class ArticleProcessor:
             {"role": "user",      "content": user_content},
         ]
 
-    # -----------------------------------------------------------------------
-    # Regex extraction (unchanged)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Regex extraction (helper used for validation + fallback merge)
+    # ------------------------------------------------------------------ #
     def _extract_iocs_regex(self, text: str) -> Dict[str, List[str]]:
         text = html.unescape(text)
         urls = self._unique_preserve_order(URL_PATTERN.findall(text))
         text_no_urls = URL_PATTERN.sub(" ", text)
+
         ipv4_raw = IPV4_PATTERN.findall(text_no_urls)
         ipv4_raw += [
-            m.group()
-            for url in urls
-            for m in IPV4_PATTERN.finditer(url)
+            m.group() for url in urls for m in IPV4_PATTERN.finditer(url)
         ]
         ipv4 = [
             ip for ip in self._unique_preserve_order(ipv4_raw)
             if not any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES)
         ]
         ipv6 = self._unique_preserve_order(IPV6_PATTERN.findall(text_no_urls))
+
         raw_domains = DOMAIN_PATTERN.findall(text_no_urls)
         domains = self._filter_domains(raw_domains)
+
         emails = self._unique_preserve_order(EMAIL_PATTERN.findall(text))
         email_domains = {e.split("@", 1)[1].lower() for e in emails}
         domains = [d for d in domains if d.lower() not in email_domains]
+
         sha256 = self._unique_preserve_order(SHA256_PATTERN.findall(text))
         sha256_set = set(sha256)
-        sha1_raw = SHA1_PATTERN.findall(text)
-        sha1 = self._unique_preserve_order([h for h in sha1_raw if h not in sha256_set])
+        sha1 = self._unique_preserve_order([
+            h for h in SHA1_PATTERN.findall(text) if h not in sha256_set
+        ])
         sha1_set = set(sha1)
-        md5_raw = MD5_PATTERN.findall(text)
-        md5 = self._unique_preserve_order([h for h in md5_raw if h not in sha256_set and h not in sha1_set])
+        md5 = self._unique_preserve_order([
+            h for h in MD5_PATTERN.findall(text)
+            if h not in sha256_set and h not in sha1_set
+        ])
+
         cves = self._unique_preserve_order([c.upper() for c in CVE_PATTERN.findall(text)])
         registry = self._unique_preserve_order(REGISTRY_PATTERN.findall(text))
-        mutex_raw = MUTEX_PATTERN.findall(text)
         mutexes = self._unique_preserve_order([
-            m for m in mutex_raw
+            m for m in MUTEX_PATTERN.findall(text)
             if not any(bl in m.lower() for bl in _DOMAIN_BLOCKLIST)
         ])
         filenames = self._unique_preserve_order(FILE_NAME_PATTERN.findall(text))
+
         return {
             "ip":           ipv4 + ipv6,
             "domain":       domains,
@@ -498,11 +566,11 @@ class ArticleProcessor:
         raw = MITRE_PATTERN.findall(html.unescape(text))
         return self._unique_preserve_order([t.upper() for t in raw])
 
-    # -----------------------------------------------------------------------
-    # Merge logic (unchanged – regex priority for strict fields)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Merge logic
+    # ------------------------------------------------------------------ #
     def _merge_iocs(
-        self, llm_iocs: Dict[str, List], regex_iocs: Dict[str, List]
+        self, llm_iocs: Dict[str, List], regex_iocs: Dict[str, List],
     ) -> Dict[str, List]:
         merged: Dict[str, List] = {}
         all_keys = set(llm_iocs.keys()) | set(regex_iocs.keys())
@@ -510,14 +578,17 @@ class ArticleProcessor:
             llm_vals   = list(llm_iocs.get(key) or [])
             regex_vals = list(regex_iocs.get(key) or [])
             if key in _REGEX_ALWAYS_MERGE:
-                # Always combine — regex has priority
-                combined = regex_vals + [v for v in llm_vals if v.lower() not in {x.lower() for x in regex_vals}]
+                combined = regex_vals + [
+                    v for v in llm_vals
+                    if v.lower() not in {x.lower() for x in regex_vals}
+                ]
             elif key in _REGEX_FALLBACK_ONLY:
-                # Use LLM if present, otherwise regex
                 combined = llm_vals if llm_vals else regex_vals
             else:
-                # Default: union
-                combined = regex_vals + [v for v in llm_vals if v.lower() not in {x.lower() for x in regex_vals}]
+                combined = regex_vals + [
+                    v for v in llm_vals
+                    if v.lower() not in {x.lower() for x in regex_vals}
+                ]
             merged[key] = self._unique_preserve_order_ci(combined)
         return merged
 
@@ -550,17 +621,12 @@ class ArticleProcessor:
             result.append(s)
         return result
 
-    # -----------------------------------------------------------------------
-    # Improved comment stripping for JSON (unchanged)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # JSON sanitisation helpers
+    # ------------------------------------------------------------------ #
     def _strip_js_comments(self, text: str) -> str:
-        """
-        Remove JavaScript-style // and /* */ comments from JSON-like text,
-        while respecting string literals.
-        """
-        # Block comments first
+        """Remove // and /* */ comments from JSON-like text (string-aware)."""
         text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-        # Line comments — only outside string literals
         lines = []
         for line in text.splitlines():
             in_str = False
@@ -568,38 +634,39 @@ class ArticleProcessor:
             i = 0
             while i < len(line):
                 ch = line[i]
-                if ch == '"' and (i == 0 or line[i-1] != '\\'):
+                if ch == '"' and (i == 0 or line[i - 1] != '\\'):
                     in_str = not in_str
-                if not in_str and ch == '/' and i+1 < len(line) and line[i+1] == '/':
-                    break  # rest of line is a comment
+                if not in_str and ch == '/' and i + 1 < len(line) and line[i + 1] == '/':
+                    break
                 out.append(ch)
                 i += 1
             lines.append(''.join(out))
         return '\n'.join(lines)
 
-    # -----------------------------------------------------------------------
-    # JSON extraction — now strips comments before parsing (unchanged)
-    # -----------------------------------------------------------------------
     def _extract_json_from_text(self, text: str) -> Optional[Dict]:
         if not text:
             return None
+
         stripped = text.strip()
         if stripped.startswith("{"):
             result = self._try_parse_json(stripped)
             if result is not None:
                 return result
-        # Look for markdown fences
-        fences = re.findall(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE)
+
+        # Markdown fences
+        fences = re.findall(
+            r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE,
+        )
         if fences:
             candidate = fences[-1].strip()
             result = self._try_parse_json(candidate)
             if result is not None:
                 return result
-            # Try stripping comments from the fence content
             cleaned = self._strip_js_comments(candidate)
             result = self._try_parse_json(cleaned)
             if result is not None:
                 return result
+
         # Prompt-leak detection
         leak_patterns = [
             r'\bassistant\s*\n',
@@ -612,50 +679,52 @@ class ArticleProcessor:
                 if m.start() > last_assistant_pos:
                     last_assistant_pos = m.start()
         if last_assistant_pos != -1:
-            after_assistant = text[last_assistant_pos:]
-            brace_idx = after_assistant.find("{")
+            after = text[last_assistant_pos:]
+            brace_idx = after.find("{")
             if brace_idx != -1:
-                candidate = after_assistant[brace_idx:]
-                result = self._try_parse_json(candidate)
-                if result is not None:
-                    return result
-                # Strip comments
-                cleaned = self._strip_js_comments(candidate)
-                result = self._try_parse_json(cleaned)
-                if result is not None:
-                    return result
-                # Repair
-                result = self._repair_and_parse(cleaned)
-                if result is not None:
-                    return result
-        # Bottom-up brace scan with comment stripping
+                candidate = after[brace_idx:]
+                for attempt in (
+                    candidate,
+                    self._strip_js_comments(candidate),
+                ):
+                    result = self._try_parse_json(attempt)
+                    if result is not None:
+                        return result
+                    result = self._repair_and_parse(attempt)
+                    if result is not None:
+                        return result
+
+        # Bottom-up brace scan
         cleaned = re.sub(r'```(?:json)?\s*', '', text, flags=re.IGNORECASE)
         cleaned = re.sub(r'```\s*', '', cleaned)
         cleaned = self._strip_js_comments(cleaned)
         starts = [m.start() for m in re.finditer(r'\{', cleaned)]
+
+        # First pass: require it to look like CTI JSON
         for start in reversed(starts):
-            json_candidate = self._extract_balanced_braces(cleaned, start)
-            if json_candidate is None:
+            candidate = self._extract_balanced_braces(cleaned, start)
+            if candidate is None:
                 continue
-            json_candidate = self._sanitize_printable(json_candidate)
-            result = self._try_parse_json(json_candidate)
-            if result is not None and self._looks_like_cti_json(result):
-                return result
-            result = self._repair_and_parse(json_candidate)
-            if result is not None and self._looks_like_cti_json(result):
-                return result
-        # Last resort: try every brace without CTI check
+            candidate = self._sanitize_printable(candidate)
+            for parsed in (
+                self._try_parse_json(candidate),
+                self._repair_and_parse(candidate),
+            ):
+                if parsed is not None and self._looks_like_cti_json(parsed):
+                    return parsed
+
+        # Second pass: accept anything JSON-shaped
         for start in reversed(starts):
-            json_candidate = self._extract_balanced_braces(cleaned, start)
-            if json_candidate is None:
+            candidate = self._extract_balanced_braces(cleaned, start)
+            if candidate is None:
                 continue
-            json_candidate = self._sanitize_printable(json_candidate)
-            result = self._try_parse_json(json_candidate)
-            if result is not None:
-                return result
-            result = self._repair_and_parse(json_candidate)
-            if result is not None:
-                return result
+            candidate = self._sanitize_printable(candidate)
+            for parsed in (
+                self._try_parse_json(candidate),
+                self._repair_and_parse(candidate),
+            ):
+                if parsed is not None:
+                    return parsed
         return None
 
     def _try_parse_json(self, text: str) -> Optional[Dict]:
@@ -689,22 +758,25 @@ class ArticleProcessor:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return text[start : i + 1]
+                    return text[start: i + 1]
         return None
 
     def _sanitize_printable(self, text: str) -> str:
         return "".join(ch for ch in text if ch in _PRINTABLE)
 
     def _repair_and_parse(self, text: str) -> Optional[Dict]:
-        # Comments are already stripped before this, but repair may add some
         text = self._strip_js_comments(text)
         steps = [
             lambda t: re.sub(r',(\s*[}\]])', r'\1', t),
             lambda t: re.sub(r'"\$([^"]+)"(\s*:)', r'"\1"\2', t),
             lambda t: re.sub(r'"@([^"]+)"(\s*:)', r'"\1"\2', t),
-            lambda t: re.sub(r'(?<=[{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:', r' "\1":', t),
+            lambda t: re.sub(
+                r'(?<=[{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:', r' "\1":', t,
+            ),
             lambda t: re.sub(r"'([^']*)'", r'"\1"', t),
-            lambda t: t.replace("None", "null").replace("True", "true").replace("False", "false"),
+            lambda t: t.replace("None", "null")
+                       .replace("True", "true")
+                       .replace("False", "false"),
             lambda t: re.sub(r'(?<=\w)\n(?=\w)', ' ', t),
         ]
         current = text
@@ -722,14 +794,17 @@ class ArticleProcessor:
         if not isinstance(data, dict):
             return False
         keys = set(data.keys())
-        if keys & {"iocs", "threat_metadata", "summary", "ioc", "metadata", "threat_meta"}:
+        if keys & {
+            "iocs", "threat_metadata", "summary", "ioc", "metadata",
+            "threat_meta", "severity", "tlp_tag",
+        }:
             return True
         known = keys & (_IOC_LIST_FIELDS | _META_LIST_FIELDS)
         return len(known) >= 2
 
-    # -----------------------------------------------------------------------
-    # Key normalisation (unchanged)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Key normalisation
+    # ------------------------------------------------------------------ #
     def _resolve_key(self, key: str) -> str:
         clean_key = key.lstrip("_$@#.")
         if key in _KEY_ALIAS:
@@ -741,27 +816,14 @@ class ArticleProcessor:
             return fuzzy
         return clean_key
 
-    @staticmethod
-    def _merge_dict_list(items: List[Any]) -> Dict[str, Any]:
-        merged: Dict[str, Any] = {}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            for k, v in item.items():
-                if k in merged:
-                    existing = merged[k] if isinstance(merged[k], list) else [merged[k]]
-                    new_vals = v if isinstance(v, list) else ([v] if v is not None else [])
-                    merged[k] = existing + new_vals
-                else:
-                    merged[k] = v
-        return merged
-
     def _normalize_json_keys(self, data: Any) -> Any:
         if isinstance(data, dict):
             new_data: Dict[str, Any] = {}
             for k, v in data.items():
                 canonical = self._resolve_key(k)
                 new_data[canonical] = self._normalize_json_keys(v)
+
+            # Flatten "iocs" list-of-dicts into a proper dict
             if "iocs" in new_data and isinstance(new_data["iocs"], list):
                 ioc_list = new_data["iocs"]
                 if ioc_list and any(isinstance(i, dict) for i in ioc_list):
@@ -770,15 +832,15 @@ class ArticleProcessor:
                         if not isinstance(item, dict):
                             continue
                         for fk, fv in item.items():
-                            resolved_fk = self._resolve_key(fk)
-                            if resolved_fk in flat:
-                                existing = flat[resolved_fk] if isinstance(flat[resolved_fk], list) else [flat[resolved_fk]]
-                                new_vals = fv if isinstance(fv, list) else ([fv] if fv is not None else [])
-                                flat[resolved_fk] = existing + new_vals
+                            rk = self._resolve_key(fk)
+                            if rk in flat:
+                                e = flat[rk] if isinstance(flat[rk], list) else [flat[rk]]
+                                n = fv if isinstance(fv, list) else ([fv] if fv is not None else [])
+                                flat[rk] = e + n
                             else:
-                                flat[resolved_fk] = fv
-                    iocs_part: Dict[str, Any] = {}
-                    meta_part: Dict[str, Any] = {}
+                                flat[rk] = fv
+
+                    iocs_part, meta_part = {}, {}
                     for fk, fv in flat.items():
                         if fk in _IOC_LIST_FIELDS:
                             iocs_part[fk] = fv
@@ -799,6 +861,8 @@ class ArticleProcessor:
                         new_data["threat_metadata"] = existing_tm
                 else:
                     new_data["iocs"] = {}
+
+            # Flatten "threat_metadata" list-of-dicts
             if "threat_metadata" in new_data and isinstance(new_data["threat_metadata"], list):
                 tm_list = new_data["threat_metadata"]
                 if tm_list and any(isinstance(i, dict) for i in tm_list):
@@ -807,16 +871,18 @@ class ArticleProcessor:
                         if not isinstance(item, dict):
                             continue
                         for fk, fv in item.items():
-                            resolved_fk = self._resolve_key(fk)
-                            if resolved_fk in merged_tm:
-                                existing = merged_tm[resolved_fk] if isinstance(merged_tm[resolved_fk], list) else [merged_tm[resolved_fk]]
-                                new_vals = fv if isinstance(fv, list) else ([fv] if fv is not None else [])
-                                merged_tm[resolved_fk] = existing + new_vals
+                            rk = self._resolve_key(fk)
+                            if rk in merged_tm:
+                                e = merged_tm[rk] if isinstance(merged_tm[rk], list) else [merged_tm[rk]]
+                                n = fv if isinstance(fv, list) else ([fv] if fv is not None else [])
+                                merged_tm[rk] = e + n
                             else:
-                                merged_tm[resolved_fk] = fv
+                                merged_tm[rk] = fv
                     new_data["threat_metadata"] = merged_tm
                 else:
                     new_data["threat_metadata"] = {}
+
+            # Hoist top-level IOC / metadata fields into their containers
             top_ioc_keys  = [k for k in new_data if k in _IOC_LIST_FIELDS]
             top_meta_keys = [k for k in new_data if k in _META_LIST_FIELDS]
             if top_ioc_keys or top_meta_keys:
@@ -847,10 +913,13 @@ class ArticleProcessor:
                 if top_meta_keys:
                     new_data["threat_metadata"] = tm_obj
             return new_data
+
         elif isinstance(data, list):
-            return [self._normalize_json_keys(item) if isinstance(item, dict) else item for item in data]
-        else:
-            return data
+            return [
+                self._normalize_json_keys(item) if isinstance(item, dict) else item
+                for item in data
+            ]
+        return data
 
     def _normalize_entity_lists(self, data: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(data, dict):
@@ -861,6 +930,9 @@ class ArticleProcessor:
                 normalized[key] = self._normalize_entity_lists(value)
             elif key == "summary":
                 normalized[key] = str(value) if value is not None else ""
+            elif key in ("severity", "tlp_tag"):
+                # Leave as-is; Pydantic validators handle normalisation.
+                normalized[key] = value
             elif key in _ALL_LIST_FIELDS:
                 if value is None:
                     normalized[key] = []
@@ -879,8 +951,10 @@ class ArticleProcessor:
         return normalized
 
     def _clean_json_data(self, data: Any) -> Any:
-        _NULL_STRINGS = frozenset({"null", "none", "n/a", "none provided",
-                                   "not applicable", "unknown", ""})
+        _NULL_STRINGS = frozenset({
+            "null", "none", "n/a", "none provided",
+            "not applicable", "unknown", "",
+        })
         if isinstance(data, dict):
             return {k: self._clean_json_data(v) for k, v in data.items()}
         elif isinstance(data, list):
@@ -892,19 +966,13 @@ class ArticleProcessor:
             if data.strip().lower() in _NULL_STRINGS:
                 return None
             return data
-        else:
-            return data
+        return data
 
-    # -----------------------------------------------------------------------
-    # IOC validation – normalizes defanged IOCs before validation
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # IOC validation (defanged normalization + placeholder rejection)
+    # ------------------------------------------------------------------ #
     def _validate_ioc_lists(self, iocs: Dict[str, List]) -> Dict[str, List]:
-        """
-        Remove invalid/malformed IOC entries using existing regex patterns.
-        Normalizes defanged indicators (hxxp, hxxps, [.], [:]) before validation,
-        but stores the original value.
-        """
-        validated = {}
+        validated: Dict[str, List] = {}
         for key, values in iocs.items():
             if not isinstance(values, list):
                 validated[key] = []
@@ -914,30 +982,32 @@ class ArticleProcessor:
                 v = str(v).strip()
                 if not v:
                     continue
-                # Skip obvious placeholders
                 if v.lower() in ("", "none", "null", "n/a", "unknown", "not applicable"):
                     continue
-                # Reject common placeholder patterns
                 if re.match(r'^CVE-\d{4}-XXXXX?$', v, re.IGNORECASE):
                     continue
                 if re.match(r'^TXXXX$', v, re.IGNORECASE):
                     continue
-                # Expanded placeholder list
                 if v.lower() in {
-                    "0.0.0.0", "127.0.0.1", "example.com", "example.org", "example.net",
-                    "test.com", "sample.com", "dummy.com", "localhost", "sample.exe"
+                    "0.0.0.0", "127.0.0.1", "example.com", "example.org",
+                    "example.net", "test.com", "sample.com", "dummy.com",
+                    "localhost", "sample.exe",
                 }:
                     continue
 
-                # Normalize defanged indicators for validation
-                norm_v = v.lower().replace("hxxp", "http").replace("hxxps", "https") \
-                                   .replace("[.]", ".").replace("[:]", ":")
-                # Also handle spaces: "hxxp ://" -> "http://"
+                # Defang normalisation for validation only — we store the
+                # original value as the analyst wrote it.
+                norm_v = (
+                    v.lower()
+                     .replace("hxxp", "http")
+                     .replace("hxxps", "https")
+                     .replace("[.]", ".")
+                     .replace("[:]", ":")
+                )
                 norm_v = re.sub(r'hxxp\s*:', 'http:', norm_v)
                 norm_v = re.sub(r'hxxps\s*:', 'https:', norm_v)
 
                 valid = True
-                # Use existing compiled patterns on the normalized version
                 if key == "ip":
                     if not (IPV4_PATTERN.fullmatch(norm_v) or IPV6_PATTERN.fullmatch(norm_v)):
                         valid = False
@@ -945,7 +1015,6 @@ class ArticleProcessor:
                     if not URL_PATTERN.fullmatch(norm_v):
                         valid = False
                 elif key == "domain":
-                    # Simple domain validation
                     if not re.match(r'^[a-zA-Z0-9.-]+$', norm_v):
                         valid = False
                 elif key == "cve":
@@ -972,17 +1041,17 @@ class ArticleProcessor:
                 elif key == "mutex":
                     if not MUTEX_PATTERN.fullmatch(norm_v):
                         valid = False
-                # malware_family – no strict validation; just ensure not empty
+
                 if valid:
-                    clean.append(v)  # store original value
+                    clean.append(v)
                 else:
-                    logger.debug(f"Removed invalid IOC {key}: {v}")
+                    logger.debug("Removed invalid IOC %s: %s", key, v)
             validated[key] = clean
         return validated
 
-    # -----------------------------------------------------------------------
-    # Parse orchestration with logging and validation after merge
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Parse orchestration
+    # ------------------------------------------------------------------ #
     def _attempt_parse(self, raw_response: str) -> Optional[ProcessedArticle]:
         if not raw_response or not raw_response.strip():
             return None
@@ -999,21 +1068,16 @@ class ArticleProcessor:
         data = self._normalize_json_keys(data)
         data = self._normalize_entity_lists(data)
 
-        # Ensure summary is present
         if "summary" not in data or not isinstance(data["summary"], str):
             data["summary"] = ""
-
-        # Ensure top-level keys exist
         if not isinstance(data.get("iocs"), dict):
             data["iocs"] = {}
         if not isinstance(data.get("threat_metadata"), dict):
             data["threat_metadata"] = {}
 
-        # Validate IOC lists (LLM IOCs only; regex merging happens later)
-        if "iocs" in data and isinstance(data["iocs"], dict):
+        if isinstance(data.get("iocs"), dict):
             data["iocs"] = self._validate_ioc_lists(data["iocs"])
 
-        # Log parsed JSON
         logger.info("=" * 80)
         logger.info("PARSED JSON")
         logger.info("=" * 80)
@@ -1026,12 +1090,14 @@ class ArticleProcessor:
         try:
             return ProcessedArticle(**data)
         except ValidationError as exc:
-            logger.warning("Pydantic validation error (trying field-by-field): %s", exc)
+            logger.warning("Pydantic validation error (field-by-field retry): %s", exc)
             try:
-                iocs     = IOCCollection(**data.get("iocs", {}))
+                iocs = IOCCollection(**data.get("iocs", {}))
                 metadata = ThreatMetadata(**data.get("threat_metadata", {}))
                 return ProcessedArticle(
                     summary=str(data.get("summary", "")),
+                    severity=data.get("severity", "Unknown"),
+                    tlp_tag=data.get("tlp_tag", "TLP:CLEAR"),
                     iocs=iocs,
                     threat_metadata=metadata,
                 )
@@ -1039,88 +1105,94 @@ class ArticleProcessor:
                 logger.warning("Field-by-field construction also failed: %s", exc2)
                 return None
 
+    # ------------------------------------------------------------------ #
+    # Regex fallback builder (kept for manual tooling, NOT auto-path)
+    # ------------------------------------------------------------------ #
     def _create_llm_fallback_article(
-        self, raw_response: str, cleaned_text: str, title: str
+        self, raw_response: str, cleaned_text: str, title: str,
     ) -> ProcessedArticle:
         full_text = cleaned_text + "\n" + (raw_response or "")
         regex_iocs = self._extract_iocs_regex(full_text)
         mitre = self._extract_mitre_techniques_regex(full_text)
         iocs = IOCCollection(**regex_iocs)
         metadata = ThreatMetadata(mitre_techniques=mitre)
-        return ProcessedArticle(summary="", iocs=iocs, threat_metadata=metadata)
+        return ProcessedArticle(
+            summary="",
+            severity="Unknown",
+            tlp_tag="TLP:CLEAR",
+            iocs=iocs,
+            threat_metadata=metadata,
+        )
 
-    # -----------------------------------------------------------------------
-    # Filter verified entities – per‑item filtering for both IOCs and metadata
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Verification filtering
+    # ------------------------------------------------------------------ #
     def _filter_verified_entities(
         self,
         provisional: ProcessedArticle,
-        verification: VerificationResult
+        verification: VerificationResult,
     ) -> ProcessedArticle:
-        """
-        Remove unverified IOCs and metadata values.
-        Metadata fields that are often inferred (attack_type, target_industry) are not filtered.
-        MITRE techniques are filtered using mitre_valid array.
-        """
-        # Filter IOCs (strict)
+        # --- IOCs (strict) ---
         new_iocs = {}
         iocs = provisional.iocs
         for field in IOCCollection.__fields__:
             values = getattr(iocs, field, [])
             verified = verification.ioc_verification.get(field, [])
-            if len(verified) == len(values):
-                filtered = [v for v, ok in zip(values, verified) if ok]
-            else:
-                # Fallback: keep all if mismatch (should not happen)
-                filtered = values
+            filtered = (
+                [v for v, ok in zip(values, verified) if ok]
+                if len(verified) == len(values)
+                else values
+            )
             new_iocs[field] = filtered
         filtered_iocs = IOCCollection(**new_iocs)
 
-        # Filter metadata – per‑item lists
-        new_meta = {}
-        meta = provisional.threat_metadata
-
-        # These fields are often inferred and should not be filtered even if not found verbatim
+        # --- Metadata ---
+        # Fields that are *inferred* rather than quoted verbatim are exempt
+        # from strict substring verification.
         soft_fields = {"attack_type", "target_industry"}
 
-        # Metadata fields (excluding mitre_techniques)
-        meta_fields = ["threat_actor", "malware_name", "attack_type", "target_organization",
-                       "target_industry", "target_country", "campaign_name",
-                       "ransomware_family", "affected_software"]
+        meta = provisional.threat_metadata
+        new_meta: Dict[str, Any] = {}
+
+        meta_fields = [
+            "threat_actor", "malware_name", "attack_type",
+            "target_organization", "target_industry", "target_country",
+            "campaign_name", "ransomware_family", "affected_software",
+        ]
         for field in meta_fields:
             values = getattr(meta, field, [])
             if field in soft_fields:
-                # Keep all values regardless of verification
                 new_meta[field] = values
                 continue
             verified = verification.metadata_verification.get(field, [])
-            if len(verified) == len(values):
-                filtered = [v for v, ok in zip(values, verified) if ok]
-            else:
-                # Fallback: keep all
-                filtered = values
-            new_meta[field] = filtered
+            new_meta[field] = (
+                [v for v, ok in zip(values, verified) if ok]
+                if len(verified) == len(values)
+                else values
+            )
 
-        # Filter MITRE techniques using mitre_valid array
+        # MITRE techniques use a dedicated validation array
         mitre_values = meta.mitre_techniques
         mitre_valid = verification.mitre_valid
-        if len(mitre_valid) == len(mitre_values):
-            new_meta["mitre_techniques"] = [t for t, ok in zip(mitre_values, mitre_valid) if ok]
-        else:
-            # Fallback: keep all if mismatch
-            new_meta["mitre_techniques"] = mitre_values
+        new_meta["mitre_techniques"] = (
+            [t for t, ok in zip(mitre_values, mitre_valid) if ok]
+            if len(mitre_valid) == len(mitre_values)
+            else mitre_values
+        )
 
         filtered_meta = ThreatMetadata(**new_meta)
 
         return ProcessedArticle(
             summary=provisional.summary,
+            severity=provisional.severity,
+            tlp_tag=provisional.tlp_tag,
             iocs=filtered_iocs,
-            threat_metadata=filtered_meta
+            threat_metadata=filtered_meta,
         )
 
-    # -----------------------------------------------------------------------
-    # Batch processing with logging (debug guard added)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Batch processing — FAIL LOUD, no silent regex fallback
+    # ------------------------------------------------------------------ #
     async def _process_batch(self, articles: List[Dict[str, Any]]) -> int:
         if not articles:
             return 0
@@ -1128,7 +1200,7 @@ class ArticleProcessor:
         messages_batch = [self._build_messages(art) for art in articles]
         success = 0
 
-        # --- Stage 1: Final prompt ---
+        # --- Log the first prompt (debug only) ---
         if messages_batch and self.debug:
             first_prompt = messages_batch[0]
             logger.info("=" * 80)
@@ -1139,26 +1211,38 @@ class ArticleProcessor:
             with open("logs/final_prompt.txt", "w", encoding="utf-8") as f:
                 json.dump(first_prompt, f, indent=2, default=str)
 
+        # --- Call Gemini ---
+        # NOTE: no `do_sample`, no `json_mode` — LLMClient handles JSON mode
+        # internally and Gemini doesn't use sampling flags the way local models do.
         try:
             raw_responses = await self.client.generate(
                 messages_batch,
-                max_new_tokens=700,
-                temperature=0.0,
-                do_sample=False,
+                max_new_tokens=settings.LLM_MAX_NEW_TOKENS,
+                temperature=settings.LLM_TEMPERATURE,
             )
         except Exception as exc:
-            logger.error("Batch LLM call failed (%s); falling back to sequential.", exc)
-            return await self._process_sequential(articles, use_fallback_prompt=False)
+            logger.exception(
+                "LLM batch call failed on %d articles — marking all as FAILED. "
+                "Reason: %s: %s",
+                len(articles), type(exc).__name__, exc,
+            )
+            for art in articles:
+                await self._mark_failed(
+                    art["metadata_hash"],
+                    f"LLM unavailable: {type(exc).__name__}: {exc}",
+                )
+            raise
 
         if len(raw_responses) != len(articles):
             logger.warning(
-                "Response count mismatch: got %d for %d articles; falling back to sequential.",
+                "Response count mismatch: got %d for %d articles; "
+                "falling back to sequential.",
                 len(raw_responses), len(articles),
             )
-            return await self._process_sequential(articles, use_fallback_prompt=False)
+            return await self._process_sequential(articles)
 
         for art, raw in zip(articles, raw_responses):
-            # --- Stage 2: Raw LLM response ---
+            # --- Raw response logging ---
             logger.info("=" * 80)
             logger.info("RAW LLM RESPONSE")
             logger.info("=" * 80)
@@ -1168,43 +1252,47 @@ class ArticleProcessor:
                 with open("logs/raw_response.txt", "w", encoding="utf-8") as f:
                     f.write(raw)
 
-            # Check for prompt leakage (echo)
-            if SYSTEM_PROMPT in raw or "You are a CTI extractor" in raw:
-                logger.warning("Prompt leakage detected. Retrying with fallback prompt.")
-                fallback_resp = await self._process_sequential([art], use_fallback_prompt=True)
-                if fallback_resp > 0:
-                    success += 1
-                    continue
-
             parsed = self._attempt_parse(raw)
             if parsed:
                 try:
                     await self._save_and_mark(art, parsed, raw)
                     success += 1
-                    logger.info("✅ Processed: %s (%s)", art["title"], art["metadata_hash"][:8])
+                    logger.info(
+                        "✅ Processed: %s (%s)",
+                        art["title"], art["metadata_hash"][:8],
+                    )
                 except Exception as exc:
-                    logger.error("Save failed for %s: %s", art["metadata_hash"][:8], exc)
-                    await self._mark_failed(art["metadata_hash"], f"Save error: {exc}")
+                    logger.error(
+                        "Save failed for %s: %s",
+                        art["metadata_hash"][:8], exc,
+                    )
+                    await self._mark_failed(
+                        art["metadata_hash"], f"Save error: {exc}",
+                    )
             else:
-                logger.warning(
-                    "Parse failed for %s — using regex fallback.", art["metadata_hash"][:8]
+                # LLM responded but no parseable JSON — mark FAILED.
+                logger.error(
+                    "LLM output not parseable for %s — marking FAILED. "
+                    "Raw (first 300 chars): %.300s",
+                    art["metadata_hash"][:8], raw or "<empty>",
                 )
-                await self._handle_parse_failure(art, raw)
-                success += 1
+                await self._mark_failed(
+                    art["metadata_hash"],
+                    "LLM returned no parseable JSON output",
+                )
 
         return success
 
-    async def _process_sequential(
-        self,
-        articles: List[Dict[str, Any]],
-        use_fallback_prompt: bool = False,
-    ) -> int:
+    # ------------------------------------------------------------------ #
+    # Sequential fallback (only used when batch response count mismatches)
+    # ------------------------------------------------------------------ #
+    async def _process_sequential(self, articles: List[Dict[str, Any]]) -> int:
         success = 0
         for art in articles:
             raw: Optional[str] = None
             parsed: Optional[ProcessedArticle] = None
+            messages = self._build_messages(art)
 
-            messages = self._build_messages(art, use_fallback=use_fallback_prompt)
             if messages and self.debug:
                 logger.info("=" * 80)
                 logger.info("FINAL PROMPT (sequential)")
@@ -1217,11 +1305,11 @@ class ArticleProcessor:
             try:
                 responses = await self.client.generate(
                     messages,
-                    max_new_tokens=700 if not use_fallback_prompt else 1024,
-                    temperature=0.0,
-                    do_sample=False,
+                    max_new_tokens=settings.LLM_MAX_NEW_TOKENS,
+                    temperature=settings.LLM_TEMPERATURE,
                 )
                 raw = responses[0] if responses else None
+
                 if raw:
                     logger.info("=" * 80)
                     logger.info("RAW LLM RESPONSE (seq)")
@@ -1233,43 +1321,74 @@ class ArticleProcessor:
                             f.write(raw)
                     parsed = self._attempt_parse(raw)
             except Exception as exc:
-                logger.warning("LLM call (normal) failed for %s: %s", art["metadata_hash"][:8], exc)
+                logger.error(
+                    "LLM call (sequential) FAILED for %s [%s]: %s",
+                    art["metadata_hash"][:8],
+                    type(exc).__name__,
+                    exc,
+                )
 
             if parsed:
                 try:
                     await self._save_and_mark(art, parsed, raw or "")
                     success += 1
-                    logger.info("✅ Processed (seq): %s (%s)", art["title"], art["metadata_hash"][:8])
+                    logger.info(
+                        "✅ Processed (seq): %s (%s)",
+                        art["title"], art["metadata_hash"][:8],
+                    )
                     continue
                 except Exception as exc:
-                    logger.error("Save failed for %s: %s", art["metadata_hash"][:8], exc)
-                    await self._mark_failed(art["metadata_hash"], f"Save error: {exc}")
+                    logger.error(
+                        "Save failed for %s: %s",
+                        art["metadata_hash"][:8], exc,
+                    )
+                    await self._mark_failed(
+                        art["metadata_hash"], f"Save error: {exc}",
+                    )
                     continue
 
-            await self._handle_parse_failure(art, raw)
-            success += 1
+            # No parseable output — FAIL LOUD, no silent regex.
+            logger.error(
+                "LLM produced no parseable output for %s — marking FAILED. "
+                "Raw (first 300 chars): %.300s",
+                art["metadata_hash"][:8], raw or "<empty>",
+            )
+            await self._mark_failed(
+                art["metadata_hash"],
+                "LLM returned no parseable JSON output",
+            )
 
         return success
 
+    # ------------------------------------------------------------------ #
+    # _handle_parse_failure is retained for potential manual tooling only.
+    # It is NOT called anywhere on the automatic path.
+    # ------------------------------------------------------------------ #
     async def _handle_parse_failure(
-        self, art: Dict[str, Any], raw: Optional[str]
+        self, art: Dict[str, Any], raw: Optional[str],
     ) -> None:
         cleaned_text = art.get("cleaned_text", "")
         fallback = self._create_llm_fallback_article(
-            raw or "", cleaned_text, art.get("title", "Untitled")
+            raw or "", cleaned_text, art.get("title", "Untitled"),
         )
         try:
             await self._save_and_mark(art, fallback, raw or "REGEX_FALLBACK")
             logger.info(
-                "✅ Regex fallback saved: %s (%s)", art["title"], art["metadata_hash"][:8]
+                "Regex fallback saved: %s (%s)",
+                art["title"], art["metadata_hash"][:8],
             )
         except Exception as exc:
-            logger.error("Regex fallback save failed for %s: %s", art["metadata_hash"][:8], exc)
-            await self._mark_failed(art["metadata_hash"], f"Fallback save error: {exc}")
+            logger.error(
+                "Regex fallback save failed for %s: %s",
+                art["metadata_hash"][:8], exc,
+            )
+            await self._mark_failed(
+                art["metadata_hash"], f"Fallback save error: {exc}",
+            )
 
-    # -----------------------------------------------------------------------
-    # Save pipeline – merge, verify, filter
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Save pipeline: merge → verify → filter → persist
+    # ------------------------------------------------------------------ #
     async def _save_and_mark(
         self,
         article: Dict[str, Any],
@@ -1278,37 +1397,38 @@ class ArticleProcessor:
     ) -> None:
         cleaned_text = article.get("cleaned_text", "")
 
-        # --- IOC merge (union) ---
+        # ---- Merge LLM IOCs with regex safety net ----
         regex_iocs  = self._extract_iocs_regex(cleaned_text)
         llm_iocs    = parsed_article.iocs.model_dump()
         merged_dict = self._merge_iocs(llm_iocs, regex_iocs)
-        # Validate merged IOCs (including defanged normalization)
         merged_dict = self._validate_ioc_lists(merged_dict)
         merged_iocs = IOCCollection(**merged_dict)
 
-        # --- MITRE merge ---
+        # ---- Merge MITRE techniques ----
         regex_mitre = self._extract_mitre_techniques_regex(cleaned_text)
         merged_meta = parsed_article.threat_metadata.model_copy(deep=True)
         merged_meta.mitre_techniques = self._unique_preserve_order_ci(
-            merged_meta.mitre_techniques + regex_mitre
+            merged_meta.mitre_techniques + regex_mitre,
         )
-        # Validate MITRE techniques (format check)
-        merged_meta.mitre_techniques = [t for t in merged_meta.mitre_techniques if MITRE_PATTERN.fullmatch(t)]
+        merged_meta.mitre_techniques = [
+            t for t in merged_meta.mitre_techniques if MITRE_PATTERN.fullmatch(t)
+        ]
 
-        # Build provisional article
+        # ---- Provisional article (severity & TLP passed through) ----
         provisional = ProcessedArticle(
             summary=parsed_article.summary,
+            severity=parsed_article.severity,
+            tlp_tag=parsed_article.tlp_tag,
             iocs=merged_iocs,
             threat_metadata=merged_meta,
         )
 
-        # --- Verify ---
+        # ---- Verify against source text ----
         verification = verify_article(cleaned_text, provisional)
 
-        # --- Filter unverified items ---
+        # ---- Filter out unverifiable items ----
         final_article = self._filter_verified_entities(provisional, verification)
 
-        # --- Log final article ---
         logger.info("=" * 80)
         logger.info("FINAL ARTICLE")
         logger.info("=" * 80)
@@ -1318,7 +1438,7 @@ class ArticleProcessor:
             with open("logs/final_article.json", "w", encoding="utf-8") as f:
                 f.write(final_article.model_dump_json(indent=2))
 
-        # --- Save ---
+        # ---- Persist ----
         await self._save_processed(
             article["metadata_hash"],
             final_article,
@@ -1340,11 +1460,12 @@ class ArticleProcessor:
         hallucination_count: int,
         evidence: Dict[str, str],
     ) -> None:
-        iocs_json     = article.iocs.model_dump_json()
-        threat_json   = article.threat_metadata.model_dump_json()
-        mitre_json    = json.dumps(article.threat_metadata.mitre_techniques)
-        evidence_json = json.dumps(evidence)
+        iocs_json       = article.iocs.model_dump_json()
+        threat_json     = article.threat_metadata.model_dump_json()
+        mitre_json      = json.dumps(article.threat_metadata.mitre_techniques)
+        evidence_json   = json.dumps(evidence)
         target_org_json = json.dumps(article.threat_metadata.target_organization)
+
         await self.db.insert_processed_article(
             metadata_hash,
             article.summary,
@@ -1357,6 +1478,8 @@ class ArticleProcessor:
             hallucination_count,
             evidence_json,
             target_org_json,
+            severity=article.severity,
+            tlp_tag=article.tlp_tag,
         )
 
     async def _mark_processed(self, metadata_hash: str) -> None:
@@ -1365,12 +1488,12 @@ class ArticleProcessor:
     async def _mark_failed(self, metadata_hash: str, error: str) -> None:
         await self.db.update_article_status(metadata_hash, "FAILED", error)
 
-    # -----------------------------------------------------------------------
-    # Run
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Runner
+    # ------------------------------------------------------------------ #
     async def run(self, limit: Optional[int] = None) -> int:
-        if not self.server_config_validated:
-            await self._verify_server_config()
+        # Fail-fast: abort the whole run if Gemini isn't reachable.
+        await self._ping_llm()
 
         start_time = time.time()
         articles = await self._fetch_pending(limit)
@@ -1381,37 +1504,54 @@ class ArticleProcessor:
         logger.info("Fetched %d pending articles.", len(articles))
         total = len(articles)
 
+        # ---- Clean HTML → text ----
         cleaned_articles: List[Dict[str, Any]] = []
         for art in articles:
             try:
                 cleaned = self._clean_html(art.get("raw_html", ""))
                 if not cleaned:
-                    logger.warning("No content extracted for %s", art["metadata_hash"][:8])
-                    await self._mark_failed(art["metadata_hash"], "Empty content after cleaning")
+                    logger.warning(
+                        "No content extracted for %s",
+                        art["metadata_hash"][:8],
+                    )
+                    await self._mark_failed(
+                        art["metadata_hash"], "Empty content after cleaning",
+                    )
                     continue
                 art["cleaned_text"] = cleaned
                 cleaned_articles.append(art)
             except Exception as exc:
-                logger.error("Cleaning failed for %s: %s", art["metadata_hash"][:8], exc)
-                await self._mark_failed(art["metadata_hash"], f"Cleaning error: {exc}")
+                logger.error(
+                    "Cleaning failed for %s: %s",
+                    art["metadata_hash"][:8], exc,
+                )
+                await self._mark_failed(
+                    art["metadata_hash"], f"Cleaning error: {exc}",
+                )
 
         if not cleaned_articles:
             logger.info("No articles with extractable content.")
             return 0
 
+        # ---- Process in batches ----
         success_count = 0
         for i in range(0, len(cleaned_articles), self.batch_size):
-            batch = cleaned_articles[i : i + self.batch_size]
+            batch = cleaned_articles[i: i + self.batch_size]
             batch_num = i // self.batch_size + 1
-            logger.info("Processing batch %d/%d (%d articles).",
-                        batch_num, -(-len(cleaned_articles) // self.batch_size), len(batch))
+            logger.info(
+                "Processing batch %d/%d (%d articles).",
+                batch_num,
+                -(-len(cleaned_articles) // self.batch_size),
+                len(batch),
+            )
             batch_success = await self._process_batch(batch)
             success_count += batch_success
 
         elapsed = time.time() - start_time
         logger.info(
             "Finished. Success: %d/%d in %.2fs (%.1f art/min).",
-            success_count, total, elapsed, (total / elapsed * 60) if elapsed > 0 else 0,
+            success_count, total, elapsed,
+            (total / elapsed * 60) if elapsed > 0 else 0,
         )
         return success_count
 
@@ -1419,16 +1559,19 @@ class ArticleProcessor:
         return await self.db.get_pending_articles(limit)
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # CLI entry point
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 async def main(limit: Optional[int] = None) -> None:
     from src.shared.database import DatabaseClient
     from src.core.config import settings
 
-    base_url = os.getenv("LLM_SERVER_URL", settings.LLM_SERVER_URL)
-    client   = LLMClient(base_url, timeout=300.0)
-    db       = DatabaseClient(settings.DB_PATH)
+    client = LLMClient(
+        api_key=settings.GEMINI_API_KEY,
+        model_name=settings.GEMINI_MODEL_NAME,
+        timeout=settings.REQUEST_TIMEOUT_SECONDS,
+    )
+    db = DatabaseClient(settings.DB_PATH)
     async with db:
         processor = ArticleProcessor(client, db, batch_size=settings.LLM_BATCH_SIZE)
         count = await processor.run(limit)

@@ -25,10 +25,12 @@ async def run_module_1():
     return count
 
 async def run_module_2(limit: int = None):
-    """Run the LLM processing pipeline (new)."""
-    # Use settings for server URL; fallback to env or default
-    base_url = settings.LLM_SERVER_URL
-    llm_client = LLMClient(base_url, timeout=settings.REQUEST_TIMEOUT_SECONDS)
+    """Run the Gemini-based LLM processing pipeline."""
+    llm_client = LLMClient(
+        api_key=settings.GEMINI_API_KEY,
+        model_name=settings.GEMINI_MODEL_NAME,
+        timeout=settings.REQUEST_TIMEOUT_SECONDS,
+    )
     async with DatabaseClient() as db:
         processor = ArticleProcessor(llm_client, db, batch_size=settings.LLM_BATCH_SIZE)
         count = await processor.run(limit)

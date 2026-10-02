@@ -29,8 +29,9 @@ async def run_processing_job(
 
         # Build dependencies (all imported from src/)
         client = LLMClient(
-            base_url=settings.LLM_SERVER_URL,
-            timeout=settings.REQUEST_TIMEOUT_SECONDS
+            api_key=settings.GEMINI_API_KEY,
+            model_name=settings.GEMINI_MODEL_NAME,
+            timeout=settings.REQUEST_TIMEOUT_SECONDS,
         )
 
         # DatabaseClient is an async context manager

@@ -1,9 +1,11 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from datetime import datetime, timezone, timedelta
 
+
 class Settings(BaseSettings):
+    # ---------- Time window ----------
     START_DATE: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc) - timedelta(days=3)
     )
@@ -11,12 +13,12 @@ class Settings(BaseSettings):
         default_factory=lambda: datetime.now(timezone.utc) + timedelta(days=1)
     )
 
+    # ---------- Networking / scraping ----------
     REQUEST_TIMEOUT_SECONDS: int = Field(320)
     MAX_RETRIES: int = Field(3)
     MAX_PAGES_PER_SOURCE: int = Field(5)
     MIN_BODY_LENGTH: int = Field(200)
 
-    # New: Advisory domains that publish short but authoritative content
     ADVISORY_DOMAINS: List[str] = [
         "msrc.microsoft.com",
         "nvd.nist.gov",
@@ -24,12 +26,9 @@ class Settings(BaseSettings):
         "kb.cert.org",
         "us-cert.cisa.gov",
     ]
-    MIN_BODY_LENGTH_ADVISORY: int = Field(50)   # accept shorter body for these domains
+    MIN_BODY_LENGTH_ADVISORY: int = Field(50)
 
-    # New: Enable/disable PDF parsing
     PDF_PARSING_ENABLED: bool = Field(True)
-
-    # New: Maximum resolution depth (1 = publisher → original, 2 = publisher → vendor → original)
     MAX_RESOLUTION_DEPTH: int = Field(2)
 
     DOMAIN_BLACKLIST: List[str] = [
@@ -73,21 +72,23 @@ class Settings(BaseSettings):
         {"name": "ANY.RUN", "base_url": "https://any.run/cybersecurity-blog/", "rss_url": None, "use_playwright": True},
     ]
 
+    # ---------- Persistence ----------
     DATA_DIR: str = Field("./data", env="DATA_DIR")
-    DB_PATH: str = Field("./data/raw_repository.db", env="DB_PATH")
+    DB_PATH: str = Field("./data/ioc_pulse.db", env="DB_PATH")
     LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
+
+    # ---------- LLM (Gemini) ----------
+    GEMINI_API_KEY: str = Field("", env="GEMINI_API_KEY")
+    GEMINI_MODEL_NAME: str = Field("gemini-2.5-flash", env="GEMINI_MODEL_NAME")
+    LLM_BATCH_SIZE: int = Field(5, env="LLM_BATCH_SIZE")
+    LLM_MAX_NEW_TOKENS: int = Field(2048, env="LLM_MAX_NEW_TOKENS")
+    LLM_TEMPERATURE: float = Field(0.0, env="LLM_TEMPERATURE")
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
     )
 
-    LLM_SERVER_URL: str = Field("http://localhost:8000", env="LLM_SERVER_URL")
-    LLM_BATCH_SIZE: int = Field(5, env="LLM_BATCH_SIZE")
-    LLM_MAX_NEW_TOKENS: int = Field(1024, env="LLM_MAX_NEW_TOKENS")
-    LLM_TEMPERATURE: float = Field(0.0, env="LLM_TEMPERATURE")
-    LLM_MODEL_NAME: str = Field("Qwen/Qwen2.5-3B-Instruct", env="LLM_MODEL_NAME")
-    LLM_USE_4BIT: bool = Field(True, env="LLM_USE_4BIT")
 
 settings = Settings()

@@ -3,15 +3,17 @@ from pydantic_settings import BaseSettings
 from pathlib import Path
 from typing import List
 
+
 class Settings(BaseSettings):
-    DB_PATH: str = "../data/raw_repository.db"
+    DB_PATH: str = "../data/ioc_pulse.db"
     API_V1_PREFIX: str = "/api/v1"
     DEBUG: bool = True
-    LLM_SERVER_URL: str = "http://localhost:8000"
-    
+
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+
     # Comma-separated list of allowed origins for CORS
-    # Example: "https://frontend-domain.com,http://localhost:3000"
-    ALLOWED_ORIGINS: str = "*"  # default to all for development
+    ALLOWED_ORIGINS: str = "*"
 
     class Config:
         env_file = ".env"
@@ -21,12 +23,11 @@ class Settings(BaseSettings):
     def get_cors_origins(self) -> List[str]:
         if self.ALLOWED_ORIGINS == "*":
             return ["*"]
-        return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",") if origin.strip()]
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
 
 settings = Settings()
 
-# Validate DB_PATH at startup
 db_path = Path(settings.DB_PATH)
 if not db_path.exists():
-    # The database will be created by DatabaseClient on first connection; just warn.
     print(f"Warning: Database file not found at {db_path}. It will be created automatically.")

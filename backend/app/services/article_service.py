@@ -11,6 +11,7 @@ from app.utils.exceptions import NotFoundError
 
 logger = logging.getLogger(__name__)
 
+
 class ArticleService:
     def __init__(self, db_service: DatabaseService):
         self.db_service = db_service
@@ -54,6 +55,12 @@ class ArticleService:
             except Exception as e:
                 logger.warning(f"Failed to parse target_organization: {e}")
 
+        # NEW: severity / tlp_tag with safe fallbacks.
+        # `row.get(...) or ...` covers both NULL and missing-column cases
+        # (e.g. older rows written before the migration).
+        severity = (row.get("severity") or "Unknown").strip() or "Unknown"
+        tlp_tag  = (row.get("tlp_tag")  or "TLP:CLEAR").strip() or "TLP:CLEAR"
+
         return ProcessedArticleResponse(
             id=row["id"],
             metadata_hash=row["metadata_hash"],
@@ -68,6 +75,8 @@ class ArticleService:
             status=row["status"],
             processing_error=row["processing_error"],
             summary=row["summary"],
+            severity=severity,          # NEW
+            tlp_tag=tlp_tag,            # NEW
             iocs=iocs,
             threat_metadata=threat_meta,
             mitre_techniques=mitre,
@@ -91,10 +100,10 @@ class ArticleService:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         sort_by: str = "published_utc",
-        sort_dir: str = "DESC"
+        sort_dir: str = "DESC",
     ) -> Dict[str, Any]:
         offset = (page - 1) * page_size
-        filters = {}
+        filters: Dict[str, Any] = {}
         if source_domain:
             filters["source_domain"] = source_domain
         if status:
@@ -115,8 +124,8 @@ class ArticleService:
                 "total": total,
                 "page": page,
                 "page_size": page_size,
-                "total_pages": total_pages
-            }
+                "total_pages": total_pages,
+            },
         }
 
     async def get_raw_article(self, article_id: int) -> RawArticleResponse:
@@ -136,10 +145,10 @@ class ArticleService:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         sort_by: str = "p.processing_timestamp",
-        sort_dir: str = "DESC"
+        sort_dir: str = "DESC",
     ) -> Dict[str, Any]:
         offset = (page - 1) * page_size
-        filters = {}
+        filters: Dict[str, Any] = {}
         if source_domain:
             filters["source_domain"] = source_domain
         if confidence_min is not None:
@@ -162,8 +171,8 @@ class ArticleService:
                 "total": total,
                 "page": page,
                 "page_size": page_size,
-                "total_pages": total_pages
-            }
+                "total_pages": total_pages,
+            },
         }
 
     async def get_processed_article(self, article_id: int) -> ProcessedArticleResponse:

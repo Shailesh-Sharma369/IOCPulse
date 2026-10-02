@@ -1,157 +1,240 @@
 """
-llm_client.py – Async HTTP client for the remote Qwen2.5 inference server.
+llm_client.py – Async client for Google Gemini structured CTI extraction.
 
-Changes vs original:
-- Retry logic now covers httpx.RemoteProtocolError (server closes connection
-  mid-stream, common under heavy GPU load).
-- Added explicit connection pool limits to prevent socket exhaustion under
-  concurrent batch calls.
-- Response validation: warns clearly when the server returns fewer responses
-  than requested rather than silently returning a mismatched list.
-- Temperature / do_sample consistency: client passes do_sample=False and
-  temperature=0.0 by default to match the server's active generation config.
-- Added __repr__ for easy debugging.
+Replaces the previous self-hosted Qwen2.5 inference server. Exposes a stable
+`generate(messages_batch, ...)` API so `ArticleProcessor` doesn't care which
+backend is in use.
+
+Key design points
+-----------------
+- Uses the official `google-genai` SDK with native JSON-mode output.
+- Sends all conversations in a batch concurrently, preserving order.
+- Explicitly disables "thinking" for Gemini 2.5+/3.x so max_output_tokens
+  is fully available for the JSON payload (thinking models otherwise spend
+  part of the budget on hidden reasoning and can return empty text).
+- Retries transient errors (5xx / network / timeouts) with exponential
+  backoff. Real errors (invalid key, bad model) fail fast — no silent
+  fallback to regex.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any, Dict, List
+from typing import Dict, List, Optional
 
-import httpx
-from tenacity import (
-    before_sleep_log,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
 
 class LLMClient:
     """
-    Thin async client for the /generate endpoint of the CTI LLM inference server.
+    Thin async wrapper around Gemini's generate_content.
 
     Parameters
     ----------
-    base_url : str
-        Base URL of the inference server (e.g. "https://abc123.ngrok.io").
+    api_key : str
+        Google AI Studio API key. Get one at
+        https://aistudio.google.com/apikey
+    model_name : str
+        Gemini model ID, e.g. "gemini-2.5-flash", "gemini-2.5-flash-lite",
+        "gemini-3.1-flash-lite".
     timeout : float
-        Per-request timeout in seconds.  Default 120 s covers long batches.
+        Soft timeout hint for callers (the SDK enforces its own HTTP timeout).
     max_retries : int
-        Number of retry attempts on transient errors.  Default 3.
+        Retry attempts on transient errors.
     """
 
     def __init__(
         self,
-        base_url: str,
+        api_key: str,
+        model_name: str = "gemini-2.5-flash-lite",
         timeout: float = 120.0,
         max_retries: int = 3,
     ) -> None:
-        self.base_url    = base_url.strip().rstrip("/")
-        self.timeout     = timeout
+        if not api_key:
+            raise ValueError(
+                "GEMINI_API_KEY is not set. Add it to your .env file "
+                "(see .env.example)."
+            )
+        self.api_key = api_key
+        self.model_name = model_name
+        self.timeout = timeout
         self.max_retries = max_retries
 
-        # Connection pool: cap concurrent connections to avoid exhaustion
-        self._limits = httpx.Limits(
-            max_keepalive_connections=5,
-            max_connections=10,
-            keepalive_expiry=30.0,
-        )
+        # The genai Client is thread-safe; async surface lives at .aio.
+        self._client = genai.Client(api_key=self.api_key)
 
     def __repr__(self) -> str:
-        return f"LLMClient(base_url={self.base_url!r}, timeout={self.timeout})"
+        return f"LLMClient(model={self.model_name!r})"
 
-    # ------------------------------------------------------------------
-    # Core generate method
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Message → Gemini conversion
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _split_messages(
+        messages: List[Dict[str, str]],
+    ) -> tuple[Optional[str], List[types.Content]]:
+        """
+        Convert OpenAI-style messages into Gemini's (system_instruction, contents).
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((
-            httpx.TimeoutException,
-            httpx.NetworkError,
-            httpx.RemoteProtocolError,   # server closed connection mid-stream
-            httpx.HTTPStatusError,
-        )),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
-        reraise=True,
-    )
+        Role mapping:
+            "system"    → system_instruction (Gemini only allows one)
+            "assistant" → "model"
+            "user"      → "user"
+        """
+        system_instruction: Optional[str] = None
+        contents: List[types.Content] = []
+
+        for msg in messages:
+            role = (msg.get("role") or "user").lower()
+            text = msg.get("content") or ""
+
+            if role == "system":
+                # Gemini allows only one system instruction; concatenate any extras.
+                system_instruction = (
+                    f"{system_instruction}\n\n{text}".strip()
+                    if system_instruction
+                    else text
+                )
+                continue
+
+            gemini_role = "model" if role in ("assistant", "model") else "user"
+            contents.append(
+                types.Content(role=gemini_role, parts=[types.Part(text=text)])
+            )
+
+        return system_instruction, contents
+
+    # ------------------------------------------------------------------ #
+    # Single-call primitive
+    # ------------------------------------------------------------------ #
+    async def _generate_one(
+        self,
+        messages: List[Dict[str, str]],
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> str:
+        system_instruction, contents = self._split_messages(messages)
+
+        # ---- Build GenerateContentConfig ----
+        # We always ask Gemini for JSON, because Module 2's only job is
+        # structured CTI extraction. The prompt contains the schema; JSON mode
+        # guarantees the response is at least *syntactically* valid JSON.
+        config_kwargs = {
+            "system_instruction": system_instruction,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_output_tokens": max_new_tokens,
+            "response_mime_type": "application/json",
+        }
+
+        # ---- Disable thinking (Gemini 2.5+/3.x) ----
+        # Thinking models silently consume max_output_tokens on hidden
+        # reasoning. For a deterministic extraction task we want all budget
+        # to go to the actual JSON payload. Older SDKs lack ThinkingConfig;
+        # we skip gracefully if unavailable.
+        try:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=0
+            )
+        except (AttributeError, TypeError):
+            pass
+
+        config = types.GenerateContentConfig(**config_kwargs)
+
+        # ---- Call with retries ----
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=config,
+                )
+
+                # Surface *why* a response was empty, instead of silently
+                # returning "" and letting the caller fall back to regex.
+                text = getattr(response, "text", None)
+                if not text:
+                    finish_reasons = [
+                        str(getattr(c, "finish_reason", None))
+                        for c in (getattr(response, "candidates", None) or [])
+                    ]
+                    feedback = getattr(response, "prompt_feedback", None)
+                    logger.error(
+                        "Gemini returned EMPTY text. model=%s "
+                        "finish_reasons=%s prompt_feedback=%s",
+                        self.model_name, finish_reasons, feedback,
+                    )
+                    raise RuntimeError(
+                        f"Gemini returned empty text (finish={finish_reasons})"
+                    )
+
+                # Success — log size only, never the payload (may contain PII).
+                logger.debug(
+                    "Gemini OK: model=%s out_chars=%d",
+                    self.model_name, len(text),
+                )
+                return text
+
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Gemini call FAILED (attempt %d/%d) [%s]: %s",
+                    attempt, self.max_retries,
+                    type(exc).__name__, exc,
+                )
+                if attempt < self.max_retries:
+                    await asyncio.sleep(min(2 ** attempt, 10))
+
+        # Final failure — raise loudly so the caller fails the job, not
+        # silently degrades to regex.
+        raise RuntimeError(
+            f"Gemini generation failed after {self.max_retries} attempts on "
+            f"model '{self.model_name}': "
+            f"{type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
+
+    # ------------------------------------------------------------------ #
+    # Public batch API
+    # ------------------------------------------------------------------ #
     async def generate(
         self,
         messages_batch: List[List[Dict[str, str]]],
-        max_new_tokens: int = 1500,
+        max_new_tokens: int = 2048,
         temperature: float = 0.0,
         top_p: float = 0.95,
-        do_sample: bool = False,
     ) -> List[str]:
         """
-        Send a batch of conversation histories to the inference server and
-        return the generated response strings in the same order.
+        Send each conversation to Gemini concurrently.
 
-        Parameters
-        ----------
-        messages_batch : list of conversation histories
-            Each element is a list of {"role": ..., "content": ...} dicts.
-        max_new_tokens : int
-            Maximum tokens to generate per response.
-        temperature : float
-            Sampling temperature.  Ignored when do_sample=False.
-        top_p : float
-            Nucleus sampling probability.  Ignored when do_sample=False.
-        do_sample : bool
-            If False (default), greedy decoding is used — consistent with
-            the server's active_generation_config.
-
-        Returns
-        -------
-        list of str
-            One response string per input conversation.  May be shorter than
-            messages_batch if the server returns a mismatched count (caller
-            should handle this case).
+        Returns one response string per input conversation, preserving order.
+        On a per-item failure, that item is replaced with "" — the caller
+        decides whether to fail the whole batch (it should).
         """
         if not messages_batch:
             return []
 
-        payload: Dict[str, Any] = {
-            "messages_batch": messages_batch,
-            "max_new_tokens": max_new_tokens,
-            "temperature":    temperature,
-            "top_p":          top_p,
-            "do_sample":      do_sample,
-        }
-
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            limits=self._limits,
-        ) as client:
-            response = await client.post(
-                f"{self.base_url}/generate",
-                json=payload,
-                headers={"Content-Type": "application/json"},
+        tasks = [
+            self._generate_one(
+                messages=msgs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
             )
+            for msgs in messages_batch
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Raise on 5xx so tenacity can retry
-            if response.status_code >= 500:
-                raise httpx.HTTPStatusError(
-                    f"Server error {response.status_code}: {response.text[:200]}",
-                    request=response.request,
-                    response=response,
-                )
-
-            response.raise_for_status()
-
-        data      = response.json()
-        responses = data.get("responses", [])
-
-        if len(responses) != len(messages_batch):
-            logger.warning(
-                "Response count mismatch from server: expected %d, got %d.",
-                len(messages_batch),
-                len(responses),
-            )
-
-        return responses
+        out: List[str] = []
+        for idx, res in enumerate(results):
+            if isinstance(res, Exception):
+                logger.error("Gemini batch item %d failed: %s", idx, res)
+                out.append("")
+            else:
+                out.append(res)
+        return out

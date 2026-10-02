@@ -3,20 +3,21 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 aiofiles>=24.1.0
 httpx>=0.25.0
-flask>=2.3.0
+apscheduler>=3.10.4
 
 # Scraping & Module 1
 aiohttp>=3.9.0
 feedparser>=6.0.10
 playwright>=1.40.0
 trafilatura>=1.8.0
-html2text>=2020.1.16
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# Database
+# Database (local SQLite only)
 aiosqlite>=0.19.0
-libsql-client>=0.0.33
+
+# LLM (Gemini)
+google-genai>=1.0.0
 
 # Utils & Processing
 tenacity>=8.2.3
@@ -25,10 +26,8 @@ pydantic-settings>=2.1.0
 python-dateutil>=2.8.2
 dateparser>=1.2.0
 python-dotenv>=1.0.0
-json5>=0.9.14
-brotli
 
-# PDF & Export (Module Last)
+# PDF & Export
 pandas>=2.1.0
 openpyxl>=3.1.0
 pypdf>=4.0.0

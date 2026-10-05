@@ -9,11 +9,14 @@ class Settings(BaseSettings):
     API_V1_PREFIX: str = "/api/v1"
     DEBUG: bool = True
 
-    GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
-
     # Comma-separated list of allowed origins for CORS
     ALLOWED_ORIGINS: str = "*"
+
+    # ---- CVE enrichment (Phase 3) ----
+    # Optional. If empty, NVD requests are made without an API key and are
+    # aggressively rate-limited (5 req / 30 s). Set a free key for 50 req / 30 s.
+    # Request one at: https://nvd.nist.gov/developers/request-an-api-key
+    NVD_API_KEY: str = ""
 
     class Config:
         env_file = ".env"

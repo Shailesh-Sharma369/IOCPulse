@@ -13,17 +13,8 @@ Pipeline
     → _merge_iocs()               Union of LLM output and regex fallback
     → verify_article()            Confidence scoring against original text
     → _filter_verified_entities() Remove unverifiable values
-    → _save_and_mark()            Persist to DB with severity/TLP
-
-Design notes
-------------
-- Regex extraction is a *validation helper*, not a substitute for the LLM.
-  If Gemini fails, we mark the article FAILED — we do NOT silently fall back
-  to regex. Failing closed keeps CTI data trustworthy.
-- All LLM JSON passes through _extract_json_from_text + Pydantic validation,
-  so minor Gemini formatting slips are auto-repaired.
-- Verification filtering runs per-item on IOCs and metadata (not field-level)
-  to preserve partial information while culling hallucinations.
+    → fetch_cve_details()         NVD enrichment (Phase 3, best-effort)
+    → _save_and_mark()            Persist to DB with severity/TLP/CVE details
 """
 
 import asyncio
@@ -39,7 +30,28 @@ import html
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
-sys.path.append(str(Path(__file__).parent.parent.parent))
+# ---------------------------------------------------------------------------
+# Path setup: allow imports from both `src.` and `app.` namespaces.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+_BACKEND_ROOT = _REPO_ROOT / "backend"
+if _BACKEND_ROOT.exists() and str(_BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_ROOT))
+
+# Fallback: if for any reason backend isn't importable, load cve_api.py
+# directly from its file path so the pipeline never hard-fails.
+try:
+    from app.utils.cve_api import fetch_cve_details
+except ImportError:  # pragma: no cover
+    import importlib.util as _importlib_util
+    _cve_path = _BACKEND_ROOT / "app" / "utils" / "cve_api.py"
+    _spec = _importlib_util.spec_from_file_location("cve_api_fallback", _cve_path)
+    _cve_mod = _importlib_util.module_from_spec(_spec)
+    _spec.loader.exec_module(_cve_mod)
+    fetch_cve_details = _cve_mod.fetch_cve_details
 
 import trafilatura
 from bs4 import BeautifulSoup
@@ -57,7 +69,6 @@ from src.module_2_llm_processing.verification import (
 
 logger = logging.getLogger(__name__)
 
-# Ensure a logs/ dir exists only when debug file writes are enabled.
 if os.getenv("DEBUG_WRITE_FILES", "false").lower() == "true":
     Path("logs").mkdir(exist_ok=True)
 
@@ -93,8 +104,7 @@ SYSTEM_PROMPT = (
     "  - \"TLP:AMBER\": limited disclosure; sharing within the recipient org\n"
     "    and its clients only. Use if the article is marked TLP:AMBER.\n"
     "  - \"TLP:GREEN\": community-wide sharing (e.g. sector, country).\n"
-    "  - \"TLP:CLEAR\": public / unrestricted. This is the DEFAULT for\n"
-    "    public advisories, vendor blogs, and news articles.\n"
+    "  - \"TLP:CLEAR\": public / unrestricted. DEFAULT for public advisories.\n"
     "  If the article does not state a TLP, default to TLP:CLEAR.\n"
     "\n"
     "Schema:\n"
@@ -114,13 +124,11 @@ SYSTEM_PROMPT = (
     "}"
 )
 
-# Kept for potential manual "reprocess with fallback prompt" tooling. Not
-# on the automatic path anymore.
 FALLBACK_PROMPT = "\n\nOutput ONLY raw JSON with the exact schema. No extra text."
 
 
 # --------------------------------------------------------------------------- #
-# REGEX PATTERNS (validation + safety net for what the LLM returns)
+# REGEX PATTERNS
 # --------------------------------------------------------------------------- #
 IPV4_PATTERN = re.compile(
     r'(?<![.\d])'
@@ -128,14 +136,12 @@ IPV4_PATTERN = re.compile(
     r'(?:25[0-5]|2[0-4]\d|[01]?\d\d?)'
     r'(?![.\d])'
 )
-
 IPV6_PATTERN = re.compile(
     r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b'
     r'|\b(?:[0-9a-fA-F]{1,4}:){1,7}:\b'
     r'|\b::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b'
     r'|\b(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}\b'
 )
-
 URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
@@ -151,19 +157,16 @@ REGISTRY_PATTERN = re.compile(
     r'HKEY_USERS|HKEY_CURRENT_CONFIG|HKLM|HKCU|HKCR|HKU|HKCC)'
     r'\\[A-Za-z0-9_\\\-\.]+\b'
 )
-
 MUTEX_PATTERN = re.compile(
     r'\b(?:Global|Local)\\[^\s<>{}\[\]"\'`\\]{3,64}\b'
     r'|\bMutex[A-Za-z0-9_\-]{3,32}\b'
     r'|\b[A-Za-z][A-Za-z0-9_\-]{2,20}Mutex\b'
 )
-
 FILE_NAME_PATTERN = re.compile(
     r'\b\w[\w\-\.]{0,64}'
     r'\.(?:exe|dll|sys|bat|cmd|ps1|vbs|js|hta|scr|pif|jar|apk|ipa|sh|py|pl|rb)\b',
     re.IGNORECASE
 )
-
 DOMAIN_PATTERN = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.){1,10}[a-zA-Z]{2,}\b')
 
 
@@ -182,19 +185,17 @@ _DOMAIN_BLOCKLIST = frozenset({
     'fonts.googleapis.com', 'ajax.googleapis.com', 'cdnjs.cloudflare.com',
     'jquery.com', 'bootstrapcdn.com',
 })
-
 _FILE_EXTENSIONS = frozenset({
     '.exe', '.dll', '.sys', '.pdf', '.doc', '.docx', '.xls', '.xlsx',
     '.zip', '.rar', '.7z', '.js', '.vbs', '.ps1', '.bat', '.cmd',
     '.sh', '.py', '.jar', '.apk', '.ipa', '.hta', '.scr',
 })
-
 _PRIVATE_IP_PREFIXES = ('10.', '192.168.', '127.', '0.', '255.')
 _PRINTABLE = frozenset(string.printable)
 
 
 # --------------------------------------------------------------------------- #
-# Key alias map (LLM might return any casing / synonym)
+# Key alias map
 # --------------------------------------------------------------------------- #
 _KEY_ALIAS: Dict[str, str] = {
     "ioc": "iocs", "iobs": "iocs", "indicators": "iocs",
@@ -276,9 +277,6 @@ _FUZZY_CANONICAL_KEYS: List[str] = [
     if len(k) > 4
 ]
 
-# Merge strategy:
-#   _REGEX_ALWAYS_MERGE  → union LLM + regex (regex has priority)
-#   _REGEX_FALLBACK_ONLY → use LLM if non-empty, else regex
 _REGEX_ALWAYS_MERGE  = frozenset({"ip", "cve", "md5", "sha1", "sha256", "url"})
 _REGEX_FALLBACK_ONLY = frozenset({
     "domain", "email", "file_name", "registry_key", "mutex", "malware_family",
@@ -286,13 +284,10 @@ _REGEX_FALLBACK_ONLY = frozenset({
 
 
 def _fuzzy_resolve_key(key: str) -> Optional[str]:
-    """Levenshtein-style fuzzy match against canonical keys."""
     if len(key) <= 4:
         return None
     key_lower = key.lower().lstrip("._")
-    matches = difflib.get_close_matches(
-        key_lower, _FUZZY_CANONICAL_KEYS, n=1, cutoff=0.6,
-    )
+    matches = difflib.get_close_matches(key_lower, _FUZZY_CANONICAL_KEYS, n=1, cutoff=0.6)
     return matches[0] if matches else None
 
 
@@ -315,18 +310,10 @@ class ArticleProcessor:
         self.debug = os.getenv("DEBUG_WRITE_FILES", "false").lower() == "true"
 
     # ------------------------------------------------------------------ #
-    # LLM health-check (fail-fast)
+    # LLM health check
     # ------------------------------------------------------------------ #
     async def _ping_llm(self) -> None:
-        """
-        Send a single trivial prompt to Gemini. Fails fast if the model ID,
-        API key, or SDK wiring is wrong — instead of silently letting every
-        article fall through to a fake-success regex run.
-        """
-        logger.info(
-            "Pinging Gemini model '%s'…",
-            getattr(self.client, "model_name", "?"),
-        )
+        logger.info("Pinging Gemini model '%s'…", getattr(self.client, "model_name", "?"))
         try:
             responses = await self.client.generate(
                 [[
@@ -349,7 +336,7 @@ class ArticleProcessor:
             ) from exc
 
     # ------------------------------------------------------------------ #
-    # HTML → plain text
+    # HTML cleanup
     # ------------------------------------------------------------------ #
     def _clean_html(self, html_content: str) -> str:
         if not html_content:
@@ -371,9 +358,6 @@ class ArticleProcessor:
         ]
         return html.unescape("\n".join(lines))
 
-    # ------------------------------------------------------------------ #
-    # Semantic truncation — keeps IOC-dense lines from being cut off
-    # ------------------------------------------------------------------ #
     def _semantic_truncate(
         self,
         text: str,
@@ -397,7 +381,6 @@ class ArticleProcessor:
             r'|\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
             re.IGNORECASE,
         )
-
         ioc_lines: List[str] = []
         prose_lines: List[str] = []
         for ln in lines:
@@ -416,7 +399,6 @@ class ArticleProcessor:
         head = prose_text[:prose_head_chars]
         tail = prose_text[-prose_tail_chars:] if prose_tail_chars > 0 else ""
 
-        # Snap to a natural sentence boundary
         for sep in ('\n\n', '. ', '! ', '? '):
             idx = head.rfind(sep)
             if idx > prose_head_chars // 2:
@@ -443,8 +425,6 @@ class ArticleProcessor:
         body      = article.get("cleaned_text", "") or "No article body extracted."
         body      = self._semantic_truncate(body)
 
-        # Synthetic one-shot with fake entities. The model must NOT reuse these
-        # values — the prompt explicitly forbids it.
         example_user = (
             "Title: Example\n"
             "Article: Threat actor ExampleActor used malware.exe from 192.0.2.1 "
@@ -482,7 +462,7 @@ class ArticleProcessor:
         ]
 
     # ------------------------------------------------------------------ #
-    # Regex extraction (helper used for validation + fallback merge)
+    # Regex extraction
     # ------------------------------------------------------------------ #
     def _extract_iocs_regex(self, text: str) -> Dict[str, List[str]]:
         text = html.unescape(text)
@@ -490,9 +470,7 @@ class ArticleProcessor:
         text_no_urls = URL_PATTERN.sub(" ", text)
 
         ipv4_raw = IPV4_PATTERN.findall(text_no_urls)
-        ipv4_raw += [
-            m.group() for url in urls for m in IPV4_PATTERN.finditer(url)
-        ]
+        ipv4_raw += [m.group() for url in urls for m in IPV4_PATTERN.finditer(url)]
         ipv4 = [
             ip for ip in self._unique_preserve_order(ipv4_raw)
             if not any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES)
@@ -622,10 +600,9 @@ class ArticleProcessor:
         return result
 
     # ------------------------------------------------------------------ #
-    # JSON sanitisation helpers
+    # JSON sanitisation
     # ------------------------------------------------------------------ #
     def _strip_js_comments(self, text: str) -> str:
-        """Remove // and /* */ comments from JSON-like text (string-aware)."""
         text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
         lines = []
         for line in text.splitlines():
@@ -653,10 +630,7 @@ class ArticleProcessor:
             if result is not None:
                 return result
 
-        # Markdown fences
-        fences = re.findall(
-            r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE,
-        )
+        fences = re.findall(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE)
         if fences:
             candidate = fences[-1].strip()
             result = self._try_parse_json(candidate)
@@ -667,7 +641,6 @@ class ArticleProcessor:
             if result is not None:
                 return result
 
-        # Prompt-leak detection
         leak_patterns = [
             r'\bassistant\s*\n',
             r'<\|im_start\|>assistant',
@@ -683,10 +656,7 @@ class ArticleProcessor:
             brace_idx = after.find("{")
             if brace_idx != -1:
                 candidate = after[brace_idx:]
-                for attempt in (
-                    candidate,
-                    self._strip_js_comments(candidate),
-                ):
+                for attempt in (candidate, self._strip_js_comments(candidate)):
                     result = self._try_parse_json(attempt)
                     if result is not None:
                         return result
@@ -694,13 +664,11 @@ class ArticleProcessor:
                     if result is not None:
                         return result
 
-        # Bottom-up brace scan
         cleaned = re.sub(r'```(?:json)?\s*', '', text, flags=re.IGNORECASE)
         cleaned = re.sub(r'```\s*', '', cleaned)
         cleaned = self._strip_js_comments(cleaned)
         starts = [m.start() for m in re.finditer(r'\{', cleaned)]
 
-        # First pass: require it to look like CTI JSON
         for start in reversed(starts):
             candidate = self._extract_balanced_braces(cleaned, start)
             if candidate is None:
@@ -713,7 +681,6 @@ class ArticleProcessor:
                 if parsed is not None and self._looks_like_cti_json(parsed):
                     return parsed
 
-        # Second pass: accept anything JSON-shaped
         for start in reversed(starts):
             candidate = self._extract_balanced_braces(cleaned, start)
             if candidate is None:
@@ -770,13 +737,9 @@ class ArticleProcessor:
             lambda t: re.sub(r',(\s*[}\]])', r'\1', t),
             lambda t: re.sub(r'"\$([^"]+)"(\s*:)', r'"\1"\2', t),
             lambda t: re.sub(r'"@([^"]+)"(\s*:)', r'"\1"\2', t),
-            lambda t: re.sub(
-                r'(?<=[{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:', r' "\1":', t,
-            ),
+            lambda t: re.sub(r'(?<=[{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:', r' "\1":', t),
             lambda t: re.sub(r"'([^']*)'", r'"\1"', t),
-            lambda t: t.replace("None", "null")
-                       .replace("True", "true")
-                       .replace("False", "false"),
+            lambda t: t.replace("None", "null").replace("True", "true").replace("False", "false"),
             lambda t: re.sub(r'(?<=\w)\n(?=\w)', ' ', t),
         ]
         current = text
@@ -802,9 +765,6 @@ class ArticleProcessor:
         known = keys & (_IOC_LIST_FIELDS | _META_LIST_FIELDS)
         return len(known) >= 2
 
-    # ------------------------------------------------------------------ #
-    # Key normalisation
-    # ------------------------------------------------------------------ #
     def _resolve_key(self, key: str) -> str:
         clean_key = key.lstrip("_$@#.")
         if key in _KEY_ALIAS:
@@ -823,7 +783,6 @@ class ArticleProcessor:
                 canonical = self._resolve_key(k)
                 new_data[canonical] = self._normalize_json_keys(v)
 
-            # Flatten "iocs" list-of-dicts into a proper dict
             if "iocs" in new_data and isinstance(new_data["iocs"], list):
                 ioc_list = new_data["iocs"]
                 if ioc_list and any(isinstance(i, dict) for i in ioc_list):
@@ -839,7 +798,6 @@ class ArticleProcessor:
                                 flat[rk] = e + n
                             else:
                                 flat[rk] = fv
-
                     iocs_part, meta_part = {}, {}
                     for fk, fv in flat.items():
                         if fk in _IOC_LIST_FIELDS:
@@ -862,7 +820,6 @@ class ArticleProcessor:
                 else:
                     new_data["iocs"] = {}
 
-            # Flatten "threat_metadata" list-of-dicts
             if "threat_metadata" in new_data and isinstance(new_data["threat_metadata"], list):
                 tm_list = new_data["threat_metadata"]
                 if tm_list and any(isinstance(i, dict) for i in tm_list):
@@ -882,7 +839,6 @@ class ArticleProcessor:
                 else:
                     new_data["threat_metadata"] = {}
 
-            # Hoist top-level IOC / metadata fields into their containers
             top_ioc_keys  = [k for k in new_data if k in _IOC_LIST_FIELDS]
             top_meta_keys = [k for k in new_data if k in _META_LIST_FIELDS]
             if top_ioc_keys or top_meta_keys:
@@ -931,7 +887,6 @@ class ArticleProcessor:
             elif key == "summary":
                 normalized[key] = str(value) if value is not None else ""
             elif key in ("severity", "tlp_tag"):
-                # Leave as-is; Pydantic validators handle normalisation.
                 normalized[key] = value
             elif key in _ALL_LIST_FIELDS:
                 if value is None:
@@ -968,9 +923,6 @@ class ArticleProcessor:
             return data
         return data
 
-    # ------------------------------------------------------------------ #
-    # IOC validation (defanged normalization + placeholder rejection)
-    # ------------------------------------------------------------------ #
     def _validate_ioc_lists(self, iocs: Dict[str, List]) -> Dict[str, List]:
         validated: Dict[str, List] = {}
         for key, values in iocs.items():
@@ -995,8 +947,6 @@ class ArticleProcessor:
                 }:
                     continue
 
-                # Defang normalisation for validation only — we store the
-                # original value as the analyst wrote it.
                 norm_v = (
                     v.lower()
                      .replace("hxxp", "http")
@@ -1106,7 +1056,7 @@ class ArticleProcessor:
                 return None
 
     # ------------------------------------------------------------------ #
-    # Regex fallback builder (kept for manual tooling, NOT auto-path)
+    # Regex fallback builder (manual tooling only)
     # ------------------------------------------------------------------ #
     def _create_llm_fallback_article(
         self, raw_response: str, cleaned_text: str, title: str,
@@ -1132,10 +1082,9 @@ class ArticleProcessor:
         provisional: ProcessedArticle,
         verification: VerificationResult,
     ) -> ProcessedArticle:
-        # --- IOCs (strict) ---
         new_iocs = {}
         iocs = provisional.iocs
-        for field in IOCCollection.__fields__:
+        for field in IOCCollection.model_fields:
             values = getattr(iocs, field, [])
             verified = verification.ioc_verification.get(field, [])
             filtered = (
@@ -1146,11 +1095,7 @@ class ArticleProcessor:
             new_iocs[field] = filtered
         filtered_iocs = IOCCollection(**new_iocs)
 
-        # --- Metadata ---
-        # Fields that are *inferred* rather than quoted verbatim are exempt
-        # from strict substring verification.
         soft_fields = {"attack_type", "target_industry"}
-
         meta = provisional.threat_metadata
         new_meta: Dict[str, Any] = {}
 
@@ -1171,7 +1116,6 @@ class ArticleProcessor:
                 else values
             )
 
-        # MITRE techniques use a dedicated validation array
         mitre_values = meta.mitre_techniques
         mitre_valid = verification.mitre_valid
         new_meta["mitre_techniques"] = (
@@ -1186,12 +1130,13 @@ class ArticleProcessor:
             summary=provisional.summary,
             severity=provisional.severity,
             tlp_tag=provisional.tlp_tag,
+            cve_details=provisional.cve_details,   # preserved through filtering
             iocs=filtered_iocs,
             threat_metadata=filtered_meta,
         )
 
     # ------------------------------------------------------------------ #
-    # Batch processing — FAIL LOUD, no silent regex fallback
+    # Batch processing
     # ------------------------------------------------------------------ #
     async def _process_batch(self, articles: List[Dict[str, Any]]) -> int:
         if not articles:
@@ -1200,7 +1145,6 @@ class ArticleProcessor:
         messages_batch = [self._build_messages(art) for art in articles]
         success = 0
 
-        # --- Log the first prompt (debug only) ---
         if messages_batch and self.debug:
             first_prompt = messages_batch[0]
             logger.info("=" * 80)
@@ -1211,9 +1155,7 @@ class ArticleProcessor:
             with open("logs/final_prompt.txt", "w", encoding="utf-8") as f:
                 json.dump(first_prompt, f, indent=2, default=str)
 
-        # --- Call Gemini ---
-        # NOTE: no `do_sample`, no `json_mode` — LLMClient handles JSON mode
-        # internally and Gemini doesn't use sampling flags the way local models do.
+        # NOTE: no do_sample, no json_mode — LLMClient handles JSON internally.
         try:
             raw_responses = await self.client.generate(
                 messages_batch,
@@ -1242,7 +1184,6 @@ class ArticleProcessor:
             return await self._process_sequential(articles)
 
         for art, raw in zip(articles, raw_responses):
-            # --- Raw response logging ---
             logger.info("=" * 80)
             logger.info("RAW LLM RESPONSE")
             logger.info("=" * 80)
@@ -1270,7 +1211,6 @@ class ArticleProcessor:
                         art["metadata_hash"], f"Save error: {exc}",
                     )
             else:
-                # LLM responded but no parseable JSON — mark FAILED.
                 logger.error(
                     "LLM output not parseable for %s — marking FAILED. "
                     "Raw (first 300 chars): %.300s",
@@ -1283,9 +1223,6 @@ class ArticleProcessor:
 
         return success
 
-    # ------------------------------------------------------------------ #
-    # Sequential fallback (only used when batch response count mismatches)
-    # ------------------------------------------------------------------ #
     async def _process_sequential(self, articles: List[Dict[str, Any]]) -> int:
         success = 0
         for art in articles:
@@ -1347,7 +1284,6 @@ class ArticleProcessor:
                     )
                     continue
 
-            # No parseable output — FAIL LOUD, no silent regex.
             logger.error(
                 "LLM produced no parseable output for %s — marking FAILED. "
                 "Raw (first 300 chars): %.300s",
@@ -1360,13 +1296,10 @@ class ArticleProcessor:
 
         return success
 
-    # ------------------------------------------------------------------ #
-    # _handle_parse_failure is retained for potential manual tooling only.
-    # It is NOT called anywhere on the automatic path.
-    # ------------------------------------------------------------------ #
     async def _handle_parse_failure(
         self, art: Dict[str, Any], raw: Optional[str],
     ) -> None:
+        """Kept for manual tooling only; not on the automatic path."""
         cleaned_text = art.get("cleaned_text", "")
         fallback = self._create_llm_fallback_article(
             raw or "", cleaned_text, art.get("title", "Untitled"),
@@ -1387,7 +1320,7 @@ class ArticleProcessor:
             )
 
     # ------------------------------------------------------------------ #
-    # Save pipeline: merge → verify → filter → persist
+    # Save pipeline
     # ------------------------------------------------------------------ #
     async def _save_and_mark(
         self,
@@ -1397,14 +1330,14 @@ class ArticleProcessor:
     ) -> None:
         cleaned_text = article.get("cleaned_text", "")
 
-        # ---- Merge LLM IOCs with regex safety net ----
+        # Merge LLM IOCs with regex safety net
         regex_iocs  = self._extract_iocs_regex(cleaned_text)
         llm_iocs    = parsed_article.iocs.model_dump()
         merged_dict = self._merge_iocs(llm_iocs, regex_iocs)
         merged_dict = self._validate_ioc_lists(merged_dict)
         merged_iocs = IOCCollection(**merged_dict)
 
-        # ---- Merge MITRE techniques ----
+        # Merge MITRE techniques
         regex_mitre = self._extract_mitre_techniques_regex(cleaned_text)
         merged_meta = parsed_article.threat_metadata.model_copy(deep=True)
         merged_meta.mitre_techniques = self._unique_preserve_order_ci(
@@ -1414,7 +1347,6 @@ class ArticleProcessor:
             t for t in merged_meta.mitre_techniques if MITRE_PATTERN.fullmatch(t)
         ]
 
-        # ---- Provisional article (severity & TLP passed through) ----
         provisional = ProcessedArticle(
             summary=parsed_article.summary,
             severity=parsed_article.severity,
@@ -1423,11 +1355,34 @@ class ArticleProcessor:
             threat_metadata=merged_meta,
         )
 
-        # ---- Verify against source text ----
         verification = verify_article(cleaned_text, provisional)
-
-        # ---- Filter out unverifiable items ----
         final_article = self._filter_verified_entities(provisional, verification)
+
+        # ---- Phase 3: CVE enrichment (best-effort, NEVER crashes) ----
+        # We enrich the *verified* CVE list only — this avoids wasted NVD calls
+        # on hallucinated CVEs that were already culled by verification.
+        if final_article.iocs.cve:
+            try:
+                enriched = await fetch_cve_details(final_article.iocs.cve)
+                if enriched:
+                    final_article.cve_details = enriched
+                    resolved = sum(1 for v in enriched.values() if v)
+                    logger.info(
+                        "CVE enrichment: %d/%d resolved for %s",
+                        resolved, len(final_article.iocs.cve),
+                        article["metadata_hash"][:8],
+                    )
+                else:
+                    logger.info(
+                        "CVE enrichment: no data returned for %s",
+                        article["metadata_hash"][:8],
+                    )
+            except Exception as exc:
+                # Enrichment failure must never block the article save.
+                logger.warning(
+                    "CVE enrichment failed (non-fatal) for %s: %s",
+                    article["metadata_hash"][:8], exc,
+                )
 
         logger.info("=" * 80)
         logger.info("FINAL ARTICLE")
@@ -1438,7 +1393,6 @@ class ArticleProcessor:
             with open("logs/final_article.json", "w", encoding="utf-8") as f:
                 f.write(final_article.model_dump_json(indent=2))
 
-        # ---- Persist ----
         await self._save_processed(
             article["metadata_hash"],
             final_article,
@@ -1460,11 +1414,12 @@ class ArticleProcessor:
         hallucination_count: int,
         evidence: Dict[str, str],
     ) -> None:
-        iocs_json       = article.iocs.model_dump_json()
-        threat_json     = article.threat_metadata.model_dump_json()
-        mitre_json      = json.dumps(article.threat_metadata.mitre_techniques)
-        evidence_json   = json.dumps(evidence)
-        target_org_json = json.dumps(article.threat_metadata.target_organization)
+        iocs_json        = article.iocs.model_dump_json()
+        threat_json      = article.threat_metadata.model_dump_json()
+        mitre_json       = json.dumps(article.threat_metadata.mitre_techniques)
+        evidence_json    = json.dumps(evidence)
+        target_org_json  = json.dumps(article.threat_metadata.target_organization)
+        cve_details_json = json.dumps(article.cve_details or {})
 
         await self.db.insert_processed_article(
             metadata_hash,
@@ -1480,6 +1435,7 @@ class ArticleProcessor:
             target_org_json,
             severity=article.severity,
             tlp_tag=article.tlp_tag,
+            cve_details_json=cve_details_json,
         )
 
     async def _mark_processed(self, metadata_hash: str) -> None:
@@ -1492,7 +1448,6 @@ class ArticleProcessor:
     # Runner
     # ------------------------------------------------------------------ #
     async def run(self, limit: Optional[int] = None) -> int:
-        # Fail-fast: abort the whole run if Gemini isn't reachable.
         await self._ping_llm()
 
         start_time = time.time()
@@ -1504,36 +1459,24 @@ class ArticleProcessor:
         logger.info("Fetched %d pending articles.", len(articles))
         total = len(articles)
 
-        # ---- Clean HTML → text ----
         cleaned_articles: List[Dict[str, Any]] = []
         for art in articles:
             try:
                 cleaned = self._clean_html(art.get("raw_html", ""))
                 if not cleaned:
-                    logger.warning(
-                        "No content extracted for %s",
-                        art["metadata_hash"][:8],
-                    )
-                    await self._mark_failed(
-                        art["metadata_hash"], "Empty content after cleaning",
-                    )
+                    logger.warning("No content extracted for %s", art["metadata_hash"][:8])
+                    await self._mark_failed(art["metadata_hash"], "Empty content after cleaning")
                     continue
                 art["cleaned_text"] = cleaned
                 cleaned_articles.append(art)
             except Exception as exc:
-                logger.error(
-                    "Cleaning failed for %s: %s",
-                    art["metadata_hash"][:8], exc,
-                )
-                await self._mark_failed(
-                    art["metadata_hash"], f"Cleaning error: {exc}",
-                )
+                logger.error("Cleaning failed for %s: %s", art["metadata_hash"][:8], exc)
+                await self._mark_failed(art["metadata_hash"], f"Cleaning error: {exc}")
 
         if not cleaned_articles:
             logger.info("No articles with extractable content.")
             return 0
 
-        # ---- Process in batches ----
         success_count = 0
         for i in range(0, len(cleaned_articles), self.batch_size):
             batch = cleaned_articles[i: i + self.batch_size]
@@ -1560,7 +1503,7 @@ class ArticleProcessor:
 
 
 # --------------------------------------------------------------------------- #
-# CLI entry point
+# CLI
 # --------------------------------------------------------------------------- #
 async def main(limit: Optional[int] = None) -> None:
     from src.shared.database import DatabaseClient

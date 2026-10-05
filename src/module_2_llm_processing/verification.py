@@ -96,7 +96,7 @@ def verify_article(article_text: str, parsed: ProcessedArticle) -> VerificationR
 
     # ---- IOC verification ----
     iocs = parsed.iocs
-    for field_name in IOCCollection.__fields__:
+    for field_name in IOCCollection.model_fields:
         values: List[str] = getattr(iocs, field_name, [])
         field_results: List[bool] = []
         for val in values:

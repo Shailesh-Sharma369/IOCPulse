@@ -26,6 +26,117 @@ const ProcessedDetailPanel = ({ open, onClose, articleId }) => {
     return Object.values(iocs).flat().length;
   };
 
+  // ------------------------------------------------------------------ //
+  // CVE helpers (Phase 3b UI)
+  // ------------------------------------------------------------------ //
+  const getCvssColor = (score) => {
+    const s = parseFloat(score);
+    if (isNaN(s)) return 'default';
+    if (s >= 9.0) return 'error';
+    if (s >= 7.0) return 'warning';
+    return 'info';
+  };
+
+  const renderCveDetails = () => {
+    const cves = safeParse(article?.cve_details);
+    const entries = Object.entries(cves).filter(
+      ([, details]) => details && typeof details === 'object' && Object.keys(details).length > 0
+    );
+    if (entries.length === 0) return null;
+
+    return (
+      <>
+        <Divider />
+        <Typography variant="subtitle1" fontWeight="bold">
+          CVE Details ({entries.length})
+        </Typography>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+          {entries.map(([cveId, details]) => {
+            const score = details.cvss_score;
+            const severity = (details.cvss_severity || 'UNKNOWN').toUpperCase();
+            const chipColor = getCvssColor(score);
+            return (
+              <Paper key={cveId} variant="outlined" sx={{ p: 2 }}>
+                {/* Header row: CVE ID, score, severity chip */}
+                <Box
+                  sx={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    mb: 1,
+                    flexWrap: 'wrap',
+                    gap: 1,
+                  }}
+                >
+                  <Typography
+                    variant="subtitle2"
+                    fontWeight="bold"
+                    sx={{ fontFamily: 'monospace', fontSize: '0.9rem' }}
+                  >
+                    {details.cve_id || cveId}
+                  </Typography>
+                  <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+                    {score != null && (
+                      <Typography variant="body2" fontWeight="bold">
+                        CVSS {score}
+                      </Typography>
+                    )}
+                    <Chip
+                      label={severity}
+                      size="small"
+                      color={chipColor}
+                      sx={{ fontWeight: 600 }}
+                    />
+                  </Box>
+                </Box>
+
+                {/* Description */}
+                {details.description && (
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mb: 1, lineHeight: 1.5 }}
+                  >
+                    {details.description}
+                  </Typography>
+                )}
+
+                {/* Vector + optional metadata footer */}
+                <Box
+                  sx={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: 1,
+                  }}
+                >
+                  {details.cvss_vector && (
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        fontFamily: 'monospace',
+                        color: 'text.disabled',
+                        fontSize: '0.7rem',
+                      }}
+                    >
+                      {details.cvss_vector}
+                    </Typography>
+                  )}
+                  {details.published && (
+                    <Typography variant="caption" color="text.disabled">
+                      Published: {new Date(details.published).toLocaleDateString()}
+                    </Typography>
+                  )}
+                </Box>
+              </Paper>
+            );
+          })}
+        </Box>
+      </>
+    );
+  };
+
   if (!open) return null;
 
   return (
@@ -164,6 +275,11 @@ const ProcessedDetailPanel = ({ open, onClose, articleId }) => {
               <Paper variant="outlined" sx={{ p: 2, bgcolor: '#F8FAFC' }}>
                 <Typography>{article.summary || 'No summary'}</Typography>
               </Paper>
+
+              {/* ============ CVE DETAILS (Phase 3b) ============ */}
+              {renderCveDetails()}
+              {/* ================================================ */}
+
               <Divider />
               <Typography variant="subtitle1" fontWeight="bold">IOCs</Typography>
               <TableContainer component={Paper} variant="outlined">

@@ -8,10 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseClient:
-    """
-    Async SQLite client (aiosqlite only). Local file-based storage so anyone
-    can clone the repo and run it with zero external services.
-    """
+    """Async SQLite client (aiosqlite only). Local file-based storage."""
 
     def __init__(self, db_path: str = settings.DB_PATH):
         self.db_path = db_path
@@ -67,22 +64,22 @@ class DatabaseClient:
                 hallucination_count INTEGER DEFAULT 0,
                 evidence_json TEXT,
                 target_organization TEXT DEFAULT '[]',
-                severity TEXT DEFAULT 'Unknown',         -- NEW
-                tlp_tag  TEXT DEFAULT 'TLP:CLEAR'        -- NEW
+                severity TEXT DEFAULT 'Unknown',
+                tlp_tag  TEXT DEFAULT 'TLP:CLEAR',
+                cve_details_json TEXT DEFAULT '{}'
             )
         """)
 
-        # Backward-compatible column adds (safe on fresh DBs and old DBs).
-        # NOTE: SQLite ALTER TABLE ADD COLUMN with a literal DEFAULT is fast
-        # and does not rewrite the table — safe for large existing DBs.
+        # Backward-compatible column adds
         new_columns = [
             ("confidence_score",    "INTEGER DEFAULT 0"),
             ("verification_status", "TEXT DEFAULT 'unknown'"),
             ("hallucination_count", "INTEGER DEFAULT 0"),
             ("evidence_json",       "TEXT"),
             ("target_organization", "TEXT DEFAULT '[]'"),
-            ("severity",            "TEXT DEFAULT 'Unknown'"),      # NEW
-            ("tlp_tag",             "TEXT DEFAULT 'TLP:CLEAR'"),    # NEW
+            ("severity",            "TEXT DEFAULT 'Unknown'"),
+            ("tlp_tag",             "TEXT DEFAULT 'TLP:CLEAR'"),
+            ("cve_details_json",    "TEXT DEFAULT '{}'"),
         ]
         for col_name, col_type in new_columns:
             try:
@@ -90,7 +87,6 @@ class DatabaseClient:
                     f"ALTER TABLE processed_articles ADD COLUMN {col_name} {col_type}"
                 )
             except Exception:
-                # Column already exists — ignore
                 pass
 
         await self._conn.execute(
@@ -102,7 +98,6 @@ class DatabaseClient:
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_staging_status ON staging_raw(status)"
         )
-        # Indexes to speed up future severity/TLP filtering
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_processed_severity ON processed_articles(severity)"
         )
@@ -128,7 +123,6 @@ class DatabaseClient:
     async def get_pending_articles(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         query = "SELECT * FROM staging_raw WHERE status='PENDING' ORDER BY published_utc DESC"
         if limit:
-            # Cast to int to prevent SQL injection if `limit` ever comes from user input
             query += f" LIMIT {int(limit)}"
         cursor = await self._conn.execute(query)
         rows = await cursor.fetchall()
@@ -154,19 +148,22 @@ class DatabaseClient:
         hallucination_count: int = 0,
         evidence_json: str = None,
         target_organization_json: str = '[]',
-        severity: str = "Unknown",           # NEW
-        tlp_tag:  str = "TLP:CLEAR",         # NEW
+        severity: str = "Unknown",
+        tlp_tag:  str = "TLP:CLEAR",
+        cve_details_json: str = "{}",
     ):
         await self._conn.execute("""
             INSERT OR REPLACE INTO processed_articles
-            (metadata_hash, summary, iocs_json, threat_metadata_json, mitre_techniques_json,
-             llm_raw_response, processing_status, confidence_score, verification_status,
-             hallucination_count, evidence_json, target_organization, severity, tlp_tag)
-            VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS', ?, ?, ?, ?, ?, ?, ?)
+            (metadata_hash, summary, iocs_json, threat_metadata_json,
+             mitre_techniques_json, llm_raw_response, processing_status,
+             confidence_score, verification_status, hallucination_count,
+             evidence_json, target_organization, severity, tlp_tag,
+             cve_details_json)
+            VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS', ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            metadata_hash, summary, iocs_json, threat_metadata_json, mitre_techniques_json,
-            llm_raw_response, confidence_score, verification_status,
-            hallucination_count, evidence_json, target_organization_json,
-            severity, tlp_tag,
+            metadata_hash, summary, iocs_json, threat_metadata_json,
+            mitre_techniques_json, llm_raw_response, confidence_score,
+            verification_status, hallucination_count, evidence_json,
+            target_organization_json, severity, tlp_tag, cve_details_json,
         ))
         await self._conn.commit()

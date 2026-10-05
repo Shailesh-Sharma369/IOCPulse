@@ -4,10 +4,7 @@ from src.shared.database import DatabaseClient
 
 
 class DatabaseService:
-    """
-    Encapsulates all read‑only database queries for the API.
-    Uses the existing DatabaseClient (aiosqlite).
-    """
+    """Encapsulates all read-only database queries for the API."""
 
     def __init__(self, db: DatabaseClient):
         self.db = db
@@ -103,7 +100,6 @@ class DatabaseService:
         if filters.get("verification_status"):
             where_clauses.append("p.verification_status = ?")
             params.append(filters["verification_status"])
-        # NEW filters
         if filters.get("severity"):
             where_clauses.append("p.severity = ?")
             params.append(filters["severity"])
@@ -139,7 +135,7 @@ class DatabaseService:
                 p.processing_status, p.processing_timestamp,
                 p.confidence_score, p.verification_status,
                 p.hallucination_count, p.evidence_json, p.target_organization,
-                p.severity, p.tlp_tag
+                p.severity, p.tlp_tag, p.cve_details_json
             FROM staging_raw s
             JOIN processed_articles p ON s.metadata_hash = p.metadata_hash
             WHERE {where_sql}
@@ -162,7 +158,7 @@ class DatabaseService:
                 p.processing_status, p.processing_timestamp,
                 p.confidence_score, p.verification_status,
                 p.hallucination_count, p.evidence_json, p.target_organization,
-                p.severity, p.tlp_tag
+                p.severity, p.tlp_tag, p.cve_details_json
             FROM staging_raw s
             JOIN processed_articles p ON s.metadata_hash = p.metadata_hash
             WHERE s.id = ?

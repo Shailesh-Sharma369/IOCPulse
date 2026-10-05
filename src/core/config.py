@@ -27,7 +27,6 @@ class Settings(BaseSettings):
         "us-cert.cisa.gov",
     ]
     MIN_BODY_LENGTH_ADVISORY: int = Field(50)
-
     PDF_PARSING_ENABLED: bool = Field(True)
     MAX_RESOLUTION_DEPTH: int = Field(2)
 
@@ -83,6 +82,11 @@ class Settings(BaseSettings):
     LLM_BATCH_SIZE: int = Field(5, env="LLM_BATCH_SIZE")
     LLM_MAX_NEW_TOKENS: int = Field(2048, env="LLM_MAX_NEW_TOKENS")
     LLM_TEMPERATURE: float = Field(0.0, env="LLM_TEMPERATURE")
+
+    # ---------- CVE enrichment (Phase 3) ----------
+    # Optional. If empty, NVD is called unauthenticated (5 req / 30 s).
+    # Request a free key at: https://nvd.nist.gov/developers/request-an-api-key
+    NVD_API_KEY: str = Field("", env="NVD_API_KEY")
 
     model_config = SettingsConfigDict(
         env_file=".env",

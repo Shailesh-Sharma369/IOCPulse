@@ -3,7 +3,7 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
-DB_PATH = Path("data/raw_repository.db")
+DB_PATH = Path("data/ioc_pulse.db")
 OUTPUT_FILE = Path("output/cti_articles.xlsx")
 
 

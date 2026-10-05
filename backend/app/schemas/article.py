@@ -70,8 +70,9 @@ class ProcessedArticleResponse(BaseModel):
 
     # from processed_articles
     summary: Optional[str]
-    severity: str = "Unknown"          # NEW: Low | Medium | High | Critical | Unknown
-    tlp_tag: str = "TLP:CLEAR"         # NEW: TLP:CLEAR | TLP:GREEN | TLP:AMBER | TLP:RED
+    severity: str = "Unknown"
+    tlp_tag: str = "TLP:CLEAR"
+    cve_details: Optional[Dict[str, Any]] = None      # NEW — Phase 3
     iocs: Optional[IOCCollectionResponse]
     threat_metadata: Optional[ThreatMetadataResponse]
     mitre_techniques: List[str] = []

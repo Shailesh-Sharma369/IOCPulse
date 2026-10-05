@@ -55,9 +55,17 @@ class ArticleService:
             except Exception as e:
                 logger.warning(f"Failed to parse target_organization: {e}")
 
-        # NEW: severity / tlp_tag with safe fallbacks.
-        # `row.get(...) or ...` covers both NULL and missing-column cases
-        # (e.g. older rows written before the migration).
+        # NEW: CVE enrichment (Phase 3)
+        cve_details = None
+        if row.get("cve_details_json"):
+            try:
+                parsed_cve = json.loads(row["cve_details_json"])
+                if parsed_cve:   # skip empty {} stored by legacy rows
+                    cve_details = parsed_cve
+            except Exception as e:
+                logger.warning(f"Failed to parse cve_details_json: {e}")
+
+        # severity / tlp_tag with safe fallbacks for pre-migration rows
         severity = (row.get("severity") or "Unknown").strip() or "Unknown"
         tlp_tag  = (row.get("tlp_tag")  or "TLP:CLEAR").strip() or "TLP:CLEAR"
 
@@ -75,8 +83,9 @@ class ArticleService:
             status=row["status"],
             processing_error=row["processing_error"],
             summary=row["summary"],
-            severity=severity,          # NEW
-            tlp_tag=tlp_tag,            # NEW
+            severity=severity,
+            tlp_tag=tlp_tag,
+            cve_details=cve_details,     # NEW
             iocs=iocs,
             threat_metadata=threat_meta,
             mitre_techniques=mitre,

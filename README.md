@@ -47,15 +47,15 @@ IOC Pulse is an open-source CTI pipeline that ingests cybersecurity articles, ex
 
 ```mermaid
 flowchart TD
-    A[Cybersecurity Sources] --> B[Ingestion Pipeline]
-    B --> C[Gemini AI Extraction]
-    C --> D[IOC Verification]
-    D --> E[NVD CVE Enrichment]
-    E --> F[Severity and TLP]
-    F --> G[SQLite Database]
-    G --> H[FastAPI Backend]
-    H --> I[React Dashboard]
-    H --> J[CSV / JSON Export]
+    A["Cybersecurity Sources"] --> B["Ingestion Pipeline"]
+    B --> C["Gemini AI Extraction"]
+    C --> D["IOC Verification"]
+    D --> E["NVD CVE Enrichment"]
+    E --> F["Severity & TLP"]
+    F --> G["SQLite Database"]
+    G --> H["FastAPI Backend"]
+    H --> I["React Dashboard"]
+    H --> J["CSV / JSON Export"]
 ```
 
 ## 🚀 Quick Start

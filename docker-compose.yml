@@ -1,0 +1,59 @@
+# =============================================================================
+# IOC Pulse — Docker Compose
+# =============================================================================
+# Usage:
+#   1. Ensure .env exists at repo root with GEMINI_API_KEY set.
+#   2. docker compose up --build -d
+#   3. Frontend: http://localhost:3000
+#      Backend:  http://localhost:8000/docs
+# =============================================================================
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: ioc-pulse-backend:latest
+    container_name: ioc-pulse-backend
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    # Persist SQLite DB on host
+    volumes:
+      - ./data:/app/data
+
+    # Loads GEMINI_API_KEY, NVD_API_KEY, etc. from repo-root .env
+    env_file:
+      - .env
+
+    environment:
+      # Force both config modules to agree on the same DB path.
+      # ALLOWED_ORIGINS is intentionally NOT set here — it comes from
+      # backend/app/config/settings.py (already configured).
+      DB_PATH: /app/data/ioc_pulse.db
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: "http://localhost:8000"
+    image: ioc-pulse-frontend:latest
+    container_name: ioc-pulse-frontend
+    restart: unless-stopped
+
+    ports:
+      - "3000:80"
+
+    depends_on:
+      backend:
+        condition: service_healthy

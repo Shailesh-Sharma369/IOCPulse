@@ -31,6 +31,7 @@ async def run_processing_job(
         client = LLMClient(
             api_key=settings.GEMINI_API_KEY,
             model_name=settings.GEMINI_MODEL_NAME,
+            fallback_models=settings.gemini_fallback_list,
             timeout=settings.REQUEST_TIMEOUT_SECONDS,
         )
 

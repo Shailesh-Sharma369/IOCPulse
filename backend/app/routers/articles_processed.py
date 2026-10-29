@@ -14,7 +14,8 @@ router = APIRouter(prefix="/api/v1/articles/processed", tags=["processed article
 # Whitelist of allowed sort columns for processed articles (must include table alias)
 ALLOWED_SORT_COLUMNS = {
     "p.processing_timestamp", "s.published_utc", "s.id", "s.title",
-    "p.confidence_score", "p.verification_status"
+    "p.confidence_score", "p.verification_status",
+    "p.severity", "p.tlp_tag",
 }
 
 @router.get("")

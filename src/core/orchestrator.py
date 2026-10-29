@@ -29,6 +29,7 @@ async def run_module_2(limit: int = None):
     llm_client = LLMClient(
         api_key=settings.GEMINI_API_KEY,
         model_name=settings.GEMINI_MODEL_NAME,
+        fallback_models=settings.gemini_fallback_list,
         timeout=settings.REQUEST_TIMEOUT_SECONDS,
     )
     async with DatabaseClient() as db:

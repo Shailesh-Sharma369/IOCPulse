@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
 
     # Comma-separated list of allowed origins for CORS
-    ALLOWED_ORIGINS: str = "*"
+    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:5173,http://localhost:8000,http://localhost:8080" # use "*" to allow all origins
 
     # ---- CVE enrichment (Phase 3) ----
     # Optional. If empty, NVD requests are made without an API key and are

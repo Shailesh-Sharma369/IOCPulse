@@ -37,21 +37,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-_BACKEND_ROOT = _REPO_ROOT / "backend"
-if _BACKEND_ROOT.exists() and str(_BACKEND_ROOT) not in sys.path:
-    sys.path.insert(0, str(_BACKEND_ROOT))
-
-# Fallback: if for any reason backend isn't importable, load cve_api.py
-# directly from its file path so the pipeline never hard-fails.
-try:
-    from app.utils.cve_api import fetch_cve_details
-except ImportError:  # pragma: no cover
-    import importlib.util as _importlib_util
-    _cve_path = _BACKEND_ROOT / "app" / "utils" / "cve_api.py"
-    _spec = _importlib_util.spec_from_file_location("cve_api_fallback", _cve_path)
-    _cve_mod = _importlib_util.module_from_spec(_spec)
-    _spec.loader.exec_module(_cve_mod)
-    fetch_cve_details = _cve_mod.fetch_cve_details
+# CVE enrichment — canonical implementation lives in src/utils/cve_api.py.
+# backend/app/utils/cve_api.py is a shim for any backend-side callers.
+from src.utils.cve_api import fetch_cve_details
 
 import trafilatura
 from bs4 import BeautifulSoup
@@ -1512,6 +1500,7 @@ async def main(limit: Optional[int] = None) -> None:
     client = LLMClient(
         api_key=settings.GEMINI_API_KEY,
         model_name=settings.GEMINI_MODEL_NAME,
+        fallback_models=settings.gemini_fallback_list,
         timeout=settings.REQUEST_TIMEOUT_SECONDS,
     )
     db = DatabaseClient(settings.DB_PATH)

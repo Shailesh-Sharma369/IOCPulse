@@ -77,11 +77,25 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
 
     # ---------- LLM (Gemini) ----------
+    # NOTE: model_name and fallback_models come from env ONLY. No hardcoded
+    # defaults here — see GEMINI_MODEL_NAME / GEMINI_FALLBACK_MODELS below.
     GEMINI_API_KEY: str = Field("", env="GEMINI_API_KEY")
-    GEMINI_MODEL_NAME: str = Field("gemini-2.5-flash", env="GEMINI_MODEL_NAME")
+    GEMINI_MODEL_NAME: str = Field("", env="GEMINI_MODEL_NAME")
+    GEMINI_FALLBACK_MODELS: str = Field("", env="GEMINI_FALLBACK_MODELS")
     LLM_BATCH_SIZE: int = Field(5, env="LLM_BATCH_SIZE")
     LLM_MAX_NEW_TOKENS: int = Field(2048, env="LLM_MAX_NEW_TOKENS")
     LLM_TEMPERATURE: float = Field(0.0, env="LLM_TEMPERATURE")
+
+    @property
+    def gemini_fallback_list(self) -> list:
+        """
+        Parse GEMINI_FALLBACK_MODELS (comma-separated) into a list.
+        Empty env value → empty list → no fallbacks.
+        """
+        raw = (self.GEMINI_FALLBACK_MODELS or "").strip()
+        if not raw:
+            return []
+        return [m.strip() for m in raw.split(",") if m.strip()]
 
     # ---------- CVE enrichment (Phase 3) ----------
     # Optional. If empty, NVD is called unauthenticated (5 req / 30 s).

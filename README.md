@@ -17,6 +17,7 @@ IOC Pulse is an open-source CTI pipeline that ingests cybersecurity articles, ex
 
 ![IOC Pulse Dashboard](docs/dashboard.png)
 
+Gif Demo
 ![IOC Pulse Intelligence Workflow](docs/demo_gif.gif)
 
 ---
